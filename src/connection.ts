@@ -1,7 +1,6 @@
 // src/connection.ts
 import * as SecureStore from 'expo-secure-store';
 import { CookieJar } from './api/cookieJar';
-import { GatewayClient, makeNativeSocket } from './api/gatewayClient';
 import { AuthError, RestClient } from './api/restClient';
 import {
   ConnectionMode,
@@ -220,11 +219,9 @@ export async function disconnect(): Promise<void> {
   rest = null;
 }
 
-/** Mint a fresh single-use ticket and open a gateway socket (tickets live 30s — always mint immediately before connecting). */
-export async function openGateway(): Promise<GatewayClient> {
+/** Mint a fresh single-use ticket and return the ws URL to dial (tickets live
+ * 30s — always mint immediately before connecting). */
+export async function mintGatewayUrl(): Promise<string> {
   const { ticket } = await withAuthRetry((r) => r.wsTicket());
-  const r = getRest();
-  const gw = new GatewayClient((url) => makeNativeSocket(url));
-  await gw.connect(r.wsUrl(ticket));
-  return gw;
+  return getRest().wsUrl(ticket);
 }

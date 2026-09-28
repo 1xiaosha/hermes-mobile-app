@@ -10,14 +10,7 @@
 // gateway's reply. I/O is injected (`call`) so it is unit-testable.
 import type { GatewayClient } from './gatewayClient';
 import { RpcError } from './gatewayClient';
-
-/** Gateway `config.set` reply shape for key:'model'. */
-export interface ConfigSetModelResult {
-  value?: string;
-  warning?: string;
-  confirm_required?: boolean;
-  confirm_message?: string;
-}
+import { withStaleSessionRetry } from './stale-session';
 
 export type SwitchOutcome =
   | { kind: 'ok'; model: string | null } // switched; `model` is the resolved id (if returned)
@@ -36,18 +29,30 @@ export function buildSessionModelValue(provider: string, model: string): string 
 }
 
 /** Switch THIS session's model via the gateway `config.set` RPC.
- * `call` is `GatewayClient['call']` (injected for tests). */
+ * `call` is `GatewayClient['call']` (injected for tests). A stale live id (4001 at
+ * 0.21.5) is recovered once through `resumeSession` (spec §5.3, review m10). */
 export async function switchSessionModel(
   call: GatewayClient['call'],
-  args: { sessionId: string; provider: string; model: string; confirmExpensive?: boolean },
+  args: {
+    sessionId: string;
+    provider: string;
+    model: string;
+    confirmExpensive?: boolean;
+    /** Re-resume the stored session; resolves the fresh live id. */
+    resumeSession?: () => Promise<string>;
+  },
 ): Promise<SwitchOutcome> {
-  try {
-    const res = await call<ConfigSetModelResult>('config.set', {
-      session_id: args.sessionId,
+  const run = (sid: string) =>
+    call('config.set', {
+      session_id: sid,
       key: 'model',
       value: buildSessionModelValue(args.provider, args.model),
       confirm_expensive_model: Boolean(args.confirmExpensive),
     });
+  try {
+    const res = args.resumeSession
+      ? await withStaleSessionRetry(args.sessionId, run, args.resumeSession)
+      : await run(args.sessionId);
     if (res?.confirm_required) {
       return {
         kind: 'confirm',
@@ -55,7 +60,7 @@ export async function switchSessionModel(
       };
     }
     if (res?.warning && BUSY_RE.test(res.warning)) return { kind: 'busy' };
-    return { kind: 'ok', model: res?.value ?? null };
+    return { kind: 'ok', model: typeof res?.value === 'string' ? res.value : null };
   } catch (e) {
     if (e instanceof RpcError && e.code === SESSION_BUSY_CODE) return { kind: 'busy' };
     const message = e instanceof Error ? e.message : String(e);
