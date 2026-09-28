@@ -1,7 +1,9 @@
+import { useLayoutEffect, useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';
 import { Image } from 'expo-image';
 import Animated, { FadeIn } from 'react-native-reanimated';
 import { Icon } from '@/components/icon';
+import { composerMinHeight } from '@/lib/composer-height';
 import { useTheme } from '@/theme';
 
 interface ComposerProps {
@@ -40,6 +42,16 @@ export function Composer({
 }: ComposerProps) {
   const { colors, dark } = useTheme();
   const canSend = !disabled && !streaming && (value.trim().length > 0 || Boolean(stagedImageUri));
+
+  // Fabric measures a JS-cleared TextInput against its previous text, so after
+  // a send it would keep its grown height. Re-render once after an empty value
+  // is committed so composerMinHeight() can flip a layout-neutral prop and
+  // force a re-measure — see src/lib/composer-height.ts.
+  const [emptyCommitted, setEmptyCommitted] = useState(value === '');
+  useLayoutEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the follow-up commit IS the fix
+    setEmptyCommitted(value === '');
+  }, [value]);
 
   return (
     // Bottom spacing is owned by the chat screen, which tracks the keyboard
@@ -105,7 +117,15 @@ export function Composer({
           multiline
           placeholder={streaming ? 'Hermes is responding…' : 'Chat with Hermes'}
           placeholderTextColor={colors.placeholder}
-          style={{ color: colors.text, fontSize: 17, lineHeight: 23, maxHeight: 120, paddingTop: 10, paddingBottom: 2 }}
+          style={{
+            color: colors.text,
+            fontSize: 17,
+            lineHeight: 23,
+            minHeight: composerMinHeight(value, emptyCommitted),
+            maxHeight: 120,
+            paddingTop: 10,
+            paddingBottom: 2,
+          }}
         />
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
