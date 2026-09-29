@@ -10,7 +10,10 @@
 //      skips it on the initial run: the screen's first paint already loaded it (review I1).
 //   4. in-flight replay via session.events.since, from the turn anchor (fallback: the highest
 //      seq seen) so a running turn's whole unpersisted text returns after the history replace;
-//      apply only events after the batch's last message.complete; skip on truncated / no anchor.
+//      apply only events after the batch's last message.complete. A running turn probes the
+//      anchor BEFORE step 3: when the ring no longer reaches it (truncated), only the gap after
+//      the watermark is replayed, and step 3 is skipped unless a turn ended in the gap (A1;
+//      see historyAndReplay).
 //   5. live events that arrived during 2–4 were parked; flush them in seq order, deduped.
 import type { GatewayClient } from '@/api/gatewayClient';
 import type { GatewayEvent, RpcMethods } from '@/vendor/hermes-gateway';
@@ -128,27 +131,112 @@ export function createReconnectOrchestrator(deps: OrchestratorDeps): ReconnectOr
     epoch = next;
   }
 
-  async function replay(liveId: string): Promise<void> {
-    // Prefer the turn anchor so the whole unpersisted turn is re-applied after the history replace;
-    // fall back to the highest seq seen (joined mid-turn: only the gap is recoverable).
-    const last = turnAnchors.get(liveId) ?? watermarks.get(liveId);
-    if (last === undefined) return; // cold start / fresh screen: nothing to anchor a replay on
-    // P1: snapshot the watermark BEFORE this batch touches it, so we can tell which events in
-    // the batch were already applied live (as opposed to events from a gap the reconnect missed).
-    const seenBefore = watermarks.get(liveId) ?? 0;
-    let res: RpcMethods['session.events.since']['result'];
+  type SinceResult = RpcMethods['session.events.since']['result'];
+
+  /** One `session.events.since`. null on failure (0.20.4 -32601 / transient: the live stream
+   * carries on) or when the backend restarted (epoch changed: the old seqs mean nothing). */
+  async function eventsSince(liveId: string, lastSeen: number): Promise<SinceResult | null> {
+    let res: SinceResult | undefined;
     try {
-      res = await deps.client.call('session.events.since', { session_id: liveId, last_seen: last });
+      res = await deps.client.call('session.events.since', { session_id: liveId, last_seen: lastSeen });
     } catch {
-      return; // 0.20.4 (-32601) or a transient failure: the live stream carries on
+      return null;
     }
-    if (res.truncated) return;
+    if (!res) return null;
     if (epoch !== null && res.epoch && res.epoch !== epoch) {
       resetWatermarks();
       epoch = res.epoch;
-      return;
+      return null;
     }
-    const events = (Array.isArray(res.events) ? res.events : []) as unknown as GatewayEvent[];
+    return res;
+  }
+
+  function eventsOf(res: SinceResult): GatewayEvent[] {
+    return (Array.isArray(res.events) ? res.events : []) as unknown as GatewayEvent[];
+  }
+
+  function hasComplete(res: SinceResult): boolean {
+    return eventsOf(res).some((e) => e?.type === 'message.complete');
+  }
+
+  /**
+   * Steps 3–4 for a RUNNING turn. The anchor replay is only safe to pair with the history
+   * replace when the ring buffer still reaches back to the anchor; a long turn outgrows it
+   * (A1: 512 events, reasoning-heavy turns run ~1750), and the replace would then remove the
+   * unpersisted row with nothing to restore it. So probe the anchor first:
+   * - not truncated → history replace, then the anchor replay, re-fetched AFTER history so a
+   *   turn that finishes in between is not duplicated. If the ring moved past the anchor while
+   *   history loaded, the probe still holds the turn: apply it, then only what followed it.
+   * - truncated → replay only the gap after the watermark. With no turn boundary in the gap the
+   *   screen is kept as is (it is exact up to the watermark). A message.complete in the gap means
+   *   that turn is persisted, so the history replace loses nothing: replace, then apply what
+   *   follows the last complete (a turn started from another device keeps its prompt row).
+   * - the gap is truncated too, or fails → the history replace alone (the old behaviour).
+   */
+  async function historyAndReplay(storedId: string, liveId: string, skipHistory: boolean): Promise<void> {
+    // Prefer the turn anchor so the whole unpersisted turn is re-applied after the history replace;
+    // fall back to the highest seq seen (joined mid-turn: only the gap is recoverable).
+    const anchor = turnAnchors.get(liveId) ?? watermarks.get(liveId);
+    // P1: snapshot the watermark BEFORE any batch touches it, so we can tell which events in
+    // the batch were already applied live (as opposed to events from a gap the reconnect missed).
+    const seenBefore = watermarks.get(liveId) ?? 0;
+    const loadHistory = async () => {
+      if (!skipHistory) await deps.loadHistory(storedId);
+    };
+    if (anchor === undefined) return loadHistory(); // cold start / fresh screen: nothing to anchor on
+
+    const probe = await eventsSince(liveId, anchor);
+    if (disposed) return;
+    if (probe?.truncated && seenBefore > anchor) {
+      const gap = await eventsSince(liveId, seenBefore);
+      if (disposed) return;
+      if (gap && !gap.truncated) {
+        if (!hasComplete(gap)) return applyGap(liveId, gap, seenBefore);
+        await loadHistory();
+        if (disposed) return;
+        // Re-fetched AFTER history, like the anchor replay: a turn that finished during the
+        // history read is then covered by its own complete instead of drawn twice.
+        const fresh = await eventsSince(liveId, seenBefore);
+        if (disposed) return;
+        return applyAfterLastComplete(liveId, fresh && !fresh.truncated ? fresh : gap, seenBefore);
+      }
+    }
+    await loadHistory();
+    if (disposed || !probe || probe.truncated) return;
+    const res = await eventsSince(liveId, anchor);
+    if (disposed || res === null) return;
+    if (!res.truncated) return applyAfterLastComplete(liveId, res, seenBefore);
+    // The ring moved past the anchor while history loaded. What followed the probe decides:
+    const after = Math.max(seenBefore, maxSeq(probe));
+    const tail = await eventsSince(liveId, after);
+    if (disposed) return;
+    if (tail && !tail.truncated && hasComplete(tail)) {
+      // the turn finished meanwhile, so history may already hold it: reload, apply what follows
+      await loadHistory();
+      if (disposed) return;
+      return applyAfterLastComplete(liveId, tail, seenBefore);
+    }
+    applyAfterLastComplete(liveId, probe, seenBefore); // still running: the probe holds the turn
+    if (tail && !tail.truncated) applyGap(liveId, tail, after);
+  }
+
+  function maxSeq(res: SinceResult): number {
+    return eventsOf(res).reduce((m, e) => Math.max(m, seqOf(e) ?? 0), 0);
+  }
+
+  /** Truncated path: the screen was not replaced, so every event after the watermark is new. */
+  function applyGap(liveId: string, res: SinceResult, seenBefore: number): void {
+    for (const e of eventsOf(res)) {
+      const s = seqOf(e);
+      if (!e?.type || s === null || s <= seenBefore) continue;
+      noteSeq(liveId, s);
+      noteTurnAnchor({ ...e, session_id: e.session_id ?? liveId }, s);
+      deps.applyReplayedEvent({ ...e, replayed: true });
+    }
+  }
+
+  function applyAfterLastComplete(liveId: string, res: SinceResult, seenBefore: number): void {
+    const events = eventsOf(res);
     let lastComplete = -1;
     events.forEach((e, i) => {
       if (e?.type === 'message.complete') lastComplete = i;
@@ -199,11 +287,8 @@ export function createReconnectOrchestrator(deps: OrchestratorDeps): ReconnectOr
         const res = await deps.client.call('session.resume', deps.resumeParams());
         if (disposed) return;
         const running = seedFromResume(res, deps);
-        if (!skipHistory) {
-          await deps.loadHistory(storedId);
-          if (disposed) return;
-        }
-        if (running) await replay(res.session_id);
+        if (running) await historyAndReplay(storedId, res.session_id, skipHistory);
+        else if (!skipHistory) await deps.loadHistory(storedId);
         if (disposed) return;
       }
       // Fix round 1: a trigger that JOINS this run (singleFlight) after session.resume must not
