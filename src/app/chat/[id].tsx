@@ -4,11 +4,11 @@ import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, AppState, FlatList, Pressable, Share, Text, View } from 'react-native';
+import { ActivityIndicator, AppState, FlatList, Keyboard, Pressable, Share, Text, View, type HostInstance } from 'react-native';
 import Animated, { FadeIn, useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { createChatTransport, type ChatTransport } from '@/api/chat-transport';
-import { makeNativeSocket, type GatewayClient } from '@/api/gatewayClient';
+import { RpcError, makeNativeSocket, type GatewayClient } from '@/api/gatewayClient';
 import { getModelInfo } from '@/api/models';
 import { setSessionModelTarget } from '@/session-model-store';
 import { switchSessionModel, type SwitchOutcome } from '@/api/sessionModel';
@@ -22,34 +22,51 @@ import {
   pillModelId,
 } from '@/lib/model-pill';
 import { withProfile } from '@/api/profiles';
-import type { GatewayEvent, GatewayEventMap } from '@/vendor/hermes-gateway';
+import { listSkills } from '@/api/skills';
+import type { GatewayEvent, GatewayEventMap, RpcMethods } from '@/vendor/hermes-gateway';
 import { setAttachHandler } from '@/attach-bus';
-import { ApprovalCard, type ApprovalInfo } from '@/components/approval-card';
+import { ApprovalCard } from '@/components/approval-card';
+import { ClarifyCard, type ClarifyResponder } from '@/components/clarify-card';
 import { Icon } from '@/components/icon';
 import { Composer } from '@/components/composer';
 import { MessageRow, type ChatItem, type ToolInfo } from '@/components/message-row';
+import { SecureEntryCard } from '@/components/secure-entry-card';
 import { SubagentMonitorCard } from '@/components/subagent-monitor-card';
 import { ThinkingDots } from '@/components/thinking-dots';
 import { TodoCard } from '@/components/todo-card';
+import { VaultDeclinedNote } from '@/components/vault-declined-note';
 import { mintGatewayUrl, withAuthRetry } from '@/connection';
 import { getProfileState, hydrateProfileStore } from '@/profile-store';
 import { openSidebar } from '@/sidebar-store';
 import { showActionSheet } from '@/lib/action-sheet';
-import { parseApprovalRequest, resolvedCount, type ApprovalChoice } from '@/lib/approval';
 import { exportAsJsonl, exportAsText } from '@/lib/export';
 import { greetingForHour } from '@/lib/greeting';
 import { historyToItems } from '@/lib/history';
+import { afterKeyboardSettles } from '@/lib/keyboard-settle';
 import { MAX_ATTACH_BYTES, base64ByteLength, buildAttachParams, type PickedImage } from '@/lib/image-attach';
 import type { ReconnectOrchestrator, ReconnectPhase } from '@/lib/reconnect-orchestrator';
+import { createRequestResponder, type RequestResponder } from '@/lib/request-answers';
 import type { RequestRegistry } from '@/lib/request-registry';
 import { shouldWarn } from '@/lib/request-router';
+import { provenanceForCard, type SkillsLookup } from '@/lib/secure-entry';
 import { emptyBatch, finalizeBatch, reduceSubagentEvent } from '@/lib/subagent-progress';
 import { parseTodoList } from '@/lib/todo';
 import { shouldReconnect } from '@/lib/reconnect';
 import {
-  cancelLabel,
+  appendAfterStream,
+  closeStreaming,
+  createItemsMirror,
+  offsetToReveal,
+  reanchorAfterReplace,
+  withCardAnchors,
+  type CardAnchors,
+} from '@/lib/transcript-rows';
+import { completionEffects, createTurnCommands, restoreSteerText, type TurnCommands } from '@/lib/turn-commands';
+import {
   completeStatus,
+  composerMode,
   initialTurnModel,
+  isApprovalActionable,
   mergeRequestRows,
   type RequestCardState,
   type TranscriptRow,
@@ -119,10 +136,6 @@ function HeaderButton({
   );
 }
 
-/** Copy for request cards this build cannot answer yet (plan B adds the real cards). */
-const VAULT_NOTE = 'Hermes asked for a password-manager action — declined on the phone.';
-const UNSUPPORTED_NOTE = 'Hermes is waiting for an answer this version can’t show yet.';
-
 type Row = TranscriptRow<ChatItem>;
 
 export default function ChatScreen() {
@@ -130,6 +143,13 @@ export default function ChatScreen() {
   const insets = useSafeAreaInsets();
   const { id } = useLocalSearchParams<{ id: string }>();
   const [items, setItems] = useState<ChatItem[]>([]);
+  // Every transcript mutation goes through updateItems: the mirror applies it to the latest list and
+  // is the request-card anchor at once, so a card never lands above the row that asked for it (M5).
+  // A card's arrival closes the streaming segment (onNewCard), so the anchor is read after that close.
+  const [itemsMirror] = useState(() => createItemsMirror<ChatItem>(setItems, closeStreaming));
+  const updateItems = (fn: (prev: ChatItem[]) => ChatItem[]) => itemsMirror.update(fn);
+  // Cards that were open across a history replace, drawn under the reloaded last row (final review I1).
+  const [cardAnchors, setCardAnchors] = useState<CardAnchors>({});
   const [input, setInput] = useState('');
   const [stagedImage, setStagedImage] = useState<PickedImage | null>(null);
   const [thinking, setThinking] = useState(false); // sent / turn started, no tokens yet
@@ -157,7 +177,6 @@ export default function ChatScreen() {
   const keyCounter = useRef(0);
   const activeSubagentKeyRef = useRef<string | null>(null);
   const todoKeyRef = useRef<string | null>(null);
-  const itemsRef = useRef<ChatItem[]>([]); // for request-card anchors (read off-render)
   // Latest render's handlers, read by the transport's long-lived callbacks.
   const handlersRef = useRef<{
     applyEvent: (e: GatewayEvent) => void;
@@ -173,14 +192,119 @@ export default function ChatScreen() {
   const dispatchTurn = (a: TurnAction): void => transportRef.current?.store.dispatch(a);
   const resumeParams = () => withProfile({ session_id: storedIdRef.current ?? '' }, profileRef.current);
 
+  /** Typed call on this screen's single client. A's `gw()` is null before mount/after unmount;
+   *  this rejects (never throws synchronously) so command/answer code can treat it as a failure. */
+  function callGw<M extends keyof RpcMethods>(
+    method: M,
+    params: RpcMethods[M]['params'],
+  ): Promise<RpcMethods[M]['result']> {
+    const client = gw();
+    return client ? client.call(method, params) : Promise.reject(new RpcError('Not connected.', -1));
+  }
+
+  // Stop / steer (spec §5.3). Created once, on first use from a handler (never during render —
+  // its deps read refs, which the React Compiler forbids in render); every dep reads refs at call time.
+  const commandsRef = useRef<TurnCommands | null>(null);
+  function commands(): TurnCommands {
+    commandsRef.current ??= createTurnCommands({
+      call: callGw,
+      dispatch: (a) => dispatchTurn(a),
+      liveSessionId: () => liveIdRef.current,
+      turnState: () => readTurn().turn,
+      // A's transport: session.resume on the stored id, updates liveIdRef + seeds the store.
+      resumeStored: () =>
+        transportRef.current?.resumeStored() ?? Promise.reject(new RpcError('Not connected.', -1)),
+      reconnect: (trigger) => orchestratorRef.current?.reconnect(trigger) ?? Promise.resolve(),
+      setTimer: (fn, ms) => {
+        const t = setTimeout(fn, ms);
+        return () => clearTimeout(t);
+      },
+    });
+    return commandsRef.current;
+  }
+  // Unmount: cancel a pending 15 s stop fallback so it never reconnects a dead screen.
+  useEffect(() => () => commandsRef.current?.dispose(), []);
+
+  const listRef = useRef<FlatList<Row>>(null);
+  // Request cards answer through one responder (spec §6). Created lazily from a handler, like
+  // commands(): its deps read refs, which the React Compiler forbids in render.
+  const responderRef = useRef<RequestResponder | null>(null);
+  function responder(): RequestResponder {
+    responderRef.current ??= createRequestResponder({
+      // A's registry is null only before mount / after unmount → "no longer open".
+      registry: {
+        respond: (id, result) => registryRef.current?.respond(id, result) ?? false,
+        drop: (id) => registryRef.current?.drop(id),
+      },
+      call: callGw,
+      dispatch: (a) => dispatchTurn(a),
+      liveSessionId: () => liveIdRef.current,
+      current: (id) => readTurn().requests.find((r) => r.id === id),
+    });
+    return responderRef.current;
+  }
+  // ClarifyCard calls these only from its handlers, so render never builds the responder.
+  const clarifyResponder: ClarifyResponder = {
+    clarifySingle: (card, answer) => responder().clarifySingle(card, answer),
+    clarifyLock: (card, qid, answer) => responder().clarifyLock(card, qid, answer),
+    clarifySubmitAll: (card, answers) => responder().clarifySubmitAll(card, answers),
+    clarifySkipAll: (card) => responder().clarifySkipAll(card),
+  };
+
+  // Provenance for pending secret cards: one lookup per new card set, scoped to this chat's profile.
+  // Failure → "unknown" (spec §6.4). Keyed by card ids so a just-created skill is found; each card
+  // then reads the lookup that covers it (provenanceForCard), so settling never resets it.
+  const pendingSecretIds = turn.requests
+    .filter((r) => r.method === 'secret' && r.status === 'pending')
+    .map((r) => r.id)
+    .join(',');
+  const [skills, setSkills] = useState<SkillsLookup | null>(null);
+  useEffect(() => {
+    if (!pendingSecretIds) return;
+    let stale = false;
+    const ids = pendingSecretIds.split(',');
+    withAuthRetry((r) => listSkills(r, profileRef.current))
+      .then((list) => !stale && setSkills({ ids, list }))
+      .catch(() => !stale && setSkills({ ids, list: null }));
+    return () => {
+      stale = true;
+    };
+  }, [pendingSecretIds]);
+
+  async function stop() {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+    const out = await commands().stop();
+    if (!out.ok) setError(out.message);
+  }
+
+  async function steer() {
+    const text = input.trim();
+    if (!text) return;
+    setInput('');
+    setError(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    const out = await commands().steer(text);
+    if (out.kind === 'error') {
+      setError(out.message);
+      setInput((cur) => restoreSteerText(cur, text));
+      return;
+    }
+    // Close the segment streamed so far first (B1): it stays above the bubble, complete, and the
+    // turn's later deltas open a new segment below it.
+    const row: ChatItem = { key: nextKey(), role: 'user', text, complete: true, ...(out.kind === 'steered' ? { steered: true } : {}) };
+    updateItems((prev) => appendAfterStream(prev, row));
+    // F10: the fallback was a queued prompt.submit (turn → waiting), so show the dots like send().
+    if (out.kind === 'submitted') setThinking(true);
+  }
+
   function append(role: ChatItem['role'], text: string, complete = true) {
-    setItems((prev) => [...prev, { key: nextKey(), role, text, complete }]);
+    updateItems((prev) => [...prev, { key: nextKey(), role, text, complete }]);
   }
 
   /** Append streamed text to the trailing assistant message (create if absent). */
   function appendDelta(text: string) {
     setThinking(false);
-    setItems((prev) => {
+    updateItems((prev) => {
       const last = prev[prev.length - 1];
       if (last?.role === 'assistant' && !last.complete) {
         return [...prev.slice(0, -1), { ...last, text: last.text + text }];
@@ -192,14 +316,7 @@ export default function ChatScreen() {
   /** Close the trailing streaming segment: complete it, or drop it if it
    * holds only whitespace (prevents stranded carets around tool calls). */
   function finishAssistant() {
-    setItems((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === 'assistant' && !last.complete) {
-        if (!last.text.trim()) return prev.slice(0, -1);
-        return [...prev.slice(0, -1), { ...last, complete: true }];
-      }
-      return prev;
-    });
+    updateItems(closeStreaming);
   }
 
   function startTool(payload: any) {
@@ -209,12 +326,12 @@ export default function ChatScreen() {
       ...(payload?.context ? { context: String(payload.context) } : {}),
       running: true,
     };
-    setItems((prev) => [...prev, { key: nextKey(), role: 'tool', text: tool.name, tool }]);
+    updateItems((prev) => [...prev, { key: nextKey(), role: 'tool', text: tool.name, tool }]);
   }
 
   function completeTool(payload: any) {
     const tid = String(payload?.tool_id ?? '');
-    setItems((prev) => {
+    updateItems((prev) => {
       let idx = prev.findIndex((it) => it.tool?.running && it.tool.id === tid);
       if (idx < 0) {
         for (let i = prev.length - 1; i >= 0; i--) {
@@ -253,7 +370,7 @@ export default function ChatScreen() {
   function handleSubagentEvent(e: GatewayEvent) {
     const ts = Date.now();
     const sub = { type: e.type, payload: e.payload as Record<string, unknown> | undefined };
-    setItems((prev) => {
+    updateItems((prev) => {
       const k = activeSubagentKeyRef.current;
       const idx = k ? prev.findIndex((it) => it.key === k) : -1;
       if (idx >= 0 && prev[idx].subagent && !prev[idx].subagent!.finalized) {
@@ -275,7 +392,7 @@ export default function ChatScreen() {
     const k = activeSubagentKeyRef.current;
     if (!k) return;
     activeSubagentKeyRef.current = null;
-    setItems((prev) => prev.map((it) => (it.key === k && it.subagent ? { ...it, subagent: finalizeBatch(it.subagent) } : it)));
+    updateItems((prev) => prev.map((it) => (it.key === k && it.subagent ? { ...it, subagent: finalizeBatch(it.subagent) } : it)));
   }
 
   /** Update (or create) the single todo card from a `todo` tool.complete.
@@ -284,7 +401,7 @@ export default function ChatScreen() {
   function upsertTodo(payload: any): boolean {
     const list = parseTodoList(payload);
     if (list === null) return false;
-    setItems((prev) => {
+    updateItems((prev) => {
       const k = todoKeyRef.current;
       const idx = k ? prev.findIndex((it) => it.key === k) : -1;
       if (idx >= 0) {
@@ -299,42 +416,15 @@ export default function ChatScreen() {
     return true;
   }
 
-  /** Answer an approval card. 0.21.5: the response frame for THIS request id, marked answered
-   * optimistically (no ack exists — review M10). 0.20.4 legacy: approval.respond, which resolves
-   * the OLDEST pending approval (FIFO), so only the oldest legacy card is actionable. */
-  async function respondApproval(card: RequestCardState, choice: ApprovalChoice) {
-    const client = gw();
-    if (!client) return;
-    if (!card.legacy) {
-      const sent = registryRef.current?.respond(card.id, { choice }) ?? false;
-      dispatchTurn(
-        sent
-          ? { type: 'request.answered', id: card.id, resolution: choice }
-          : { type: 'request.cancelled', id: card.id, reason: 'resolved' },
-      );
-      return;
-    }
-    const sid = liveIdRef.current;
-    if (!sid) return;
-    dispatchTurn({ type: 'request.answering', id: card.id });
-    try {
-      const result = await client.call('approval.respond', { session_id: sid, choice });
-      // resolved=0 means nothing was pending server-side (stale/raced).
-      dispatchTurn(
-        resolvedCount(result) > 0
-          ? { type: 'request.answered', id: card.id, resolution: choice }
-          : { type: 'request.cancelled', id: card.id, reason: 'resolved' },
-      );
-    } catch (e) {
-      dispatchTurn({ type: 'request.failed', id: card.id }); // re-arm so the user can retry
-      setError(e instanceof Error ? e.message : 'approval response failed');
-    }
-  }
-
   async function loadHistory(storedId: string) {
     const history = await withAuthRetry((r) => r.getMessages(storedId, profileRef.current ?? undefined));
     if (cancelledRef.current) return;
-    setItems(historyToItems(history.messages, nextKey));
+    const reloaded = historyToItems(history.messages, nextKey);
+    updateItems(() => reloaded);
+    // The reload re-keyed every row: a card open now keeps its place under the new last row, so it is
+    // still drawn once it settles (final review I1). Settled cards are in the history (contract §8).
+    const requests = readTurn().requests;
+    setCardAnchors((prev) => reanchorAfterReplace(requests, prev, reloaded));
     // historyToItems never emits subagent/todo rows; clear stale live-card keys
     // so a reconnect/history replace can't update a row that no longer exists.
     // Request cards live in the turn store, NOT in items, so they survive this replace.
@@ -390,9 +480,13 @@ export default function ChatScreen() {
         setThinking(false);
         finishAssistant();
         finalizeSubagents();
-        if (status === 'interrupted') append('status', 'Stopped');
-        else if (status === 'error') setError(p?.error || 'The turn failed.');
-        else if (live) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        const fx = completionEffects(status, !live);
+        if (fx.stoppedMarker) {
+          updateItems((prev) => [...prev, { key: nextKey(), role: 'status', text: 'Stopped', marker: 'stopped' }]);
+        } else if (status === 'error') {
+          setError(p?.error || 'The turn failed.');
+        }
+        if (fx.successHaptic) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         break;
       }
       case 'tool.start': {
@@ -445,10 +539,6 @@ export default function ChatScreen() {
     }
   }
 
-  useEffect(() => {
-    itemsRef.current = items;
-  }, [items]);
-
   // Keep the transport's long-lived callbacks pointed at this render's closures.
   // Declared BEFORE the mount effect so it runs first.
   useEffect(() => {
@@ -474,7 +564,7 @@ export default function ChatScreen() {
       onResumed: (res) => setPill((p) => withResumedModel(p, res.info)),
       onPhase: (p) => handlersRef.current?.onPhase(p),
       applyEvent: (e) => handlersRef.current?.applyEvent(e),
-      anchorKey: () => itemsRef.current[itemsRef.current.length - 1]?.key ?? null,
+      anchorKey: () => itemsMirror.anchorKey(),
       onNewCard: (card, replayed) => handlersRef.current?.onNewCard(card, replayed),
     });
     transportRef.current = t;
@@ -530,7 +620,7 @@ export default function ChatScreen() {
         orchestratorRef.current = null;
       }
     };
-  }, [id]);
+  }, [id, itemsMirror]); // itemsMirror is stable (useState)
 
   // Composer model pill — best-effort, never blocks the chat.
   useEffect(() => {
@@ -653,7 +743,7 @@ export default function ChatScreen() {
     setInput('');
     setStagedImage(null);
     setError(null);
-    setItems((prev) => [
+    updateItems((prev) => [
       ...prev,
       {
         key: nextKey(),
@@ -695,49 +785,90 @@ export default function ChatScreen() {
   }
 
   // Request cards live in the turn store (outside items) and merge in after their anchor.
-  const rows = useMemo(() => mergeRequestRows(items, turn.requests), [items, turn.requests]);
+  const rows = useMemo(
+    () => mergeRequestRows(items, withCardAnchors(turn.requests, cardAnchors)),
+    [items, turn.requests, cardAnchors],
+  );
   // Inverted list: index 0 renders at the visual bottom, so newest goes first.
   const reversedRows = useMemo(() => [...rows].reverse(), [rows]);
+  // Room kept under the floating header buttons: the list's visual-top padding, and the top of the
+  // band a focused card field is scrolled into.
+  const headerClearance = insets.top + 64;
 
-  // Legacy (0.20.4) approvals are FIFO: only the oldest open legacy card is actionable.
-  // 0.21.5 approvals resolve per request id, so every pending one is actionable.
-  const activeLegacyId = turn.requests.find(
-    (r) => r.legacy && (r.status === 'pending' || r.status === 'answering'),
-  )?.id;
-
-  function approvalInfo(card: RequestCardState): ApprovalInfo | null {
-    const request = parseApprovalRequest(card.params);
-    if (!request) return null;
-    const status =
-      card.status === 'pending' || card.status === 'answering'
-        ? card.status
-        : card.status === 'answered'
-          ? card.resolution === 'deny'
-            ? ('denied' as const)
-            : ('approved' as const)
-          : ('cancelled' as const);
-    return { request, status };
+  // Focusing a card's text field: once the keyboard has finished rising (its inset, containerStyle
+  // paddingBottom, is then final — a fixed timer fired mid-rise, sim S3 s1), scroll the FIELD into the
+  // band between the header and the composer — a tall card's field is off-screen whichever card edge
+  // is aligned (sim S2 B2). Everything is measured then, so rows that changed meanwhile can't skew it
+  // (m2). One pending scroll; cancelled on unmount.
+  const scrollOffsetRef = useRef(0);
+  // While a card field has the keyboard, a tap on a card button acts at once instead of only dismissing
+  // the keyboard (sim S3 s2): the list persists taps its rows handle. With the composer's keyboard it
+  // stays 'never', so a tap on a message row still just dismisses the keyboard, as before.
+  const [cardFieldFocused, setCardFieldFocused] = useState(false);
+  useEffect(() => {
+    const sub = Keyboard.addListener('keyboardDidHide', () => setCardFieldFocused(false));
+    return () => sub.remove();
+  }, []);
+  const cancelRevealRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => cancelRevealRef.current?.(), []);
+  function revealField(measureField: HostInstance['measureInWindow']) {
+    setCardFieldFocused(true);
+    cancelRevealRef.current?.();
+    cancelRevealRef.current = afterKeyboardSettles(Keyboard, () => {
+      cancelRevealRef.current = null;
+      const list = listRef.current?.getNativeScrollRef();
+      if (!list || !('measureInWindow' in list)) return; // unmounted; FlatList's ref type is loose
+      list.measureInWindow((_lx, listY, _lw, listH) => {
+        measureField((_x, fieldY, _w, fieldH) => {
+          const offset = offsetToReveal({
+            offset: scrollOffsetRef.current,
+            fieldTop: fieldY,
+            fieldBottom: fieldY + fieldH,
+            visibleTop: listY + headerClearance,
+            visibleBottom: listY + listH, // the composer's top; the list shrinks with the keyboard
+          });
+          if (offset !== null) listRef.current?.scrollToOffset({ offset, animated: true });
+        });
+      });
+    });
   }
 
   function renderRequest(card: RequestCardState) {
-    if (card.kind === 'approval') {
-      const approval = approvalInfo(card);
-      if (!approval) return null;
-      return (
-        <ApprovalCard
-          approval={approval}
-          active={card.legacy ? card.id === activeLegacyId : card.status === 'pending'}
-          onRespond={(choice) => void respondApproval(card, choice)}
-        />
-      );
+    switch (card.kind) {
+      case 'approval':
+        return (
+          <ApprovalCard
+            card={card}
+            actionable={isApprovalActionable(turn.requests, card.id)}
+            onRespond={(choice) =>
+              void responder().approve(card, choice).then((out) => {
+                if (!out.ok) setError(out.message);
+              })
+            }
+          />
+        );
+      case 'clarify':
+        return <ClarifyCard card={card} responder={clarifyResponder} onInputFocus={revealField} />;
+      case 'secure-entry':
+        // The typed value goes straight to the response frame — never into state, a ref or an error.
+        return (
+          <SecureEntryCard
+            card={card}
+            provenance={card.method === 'secret' ? provenanceForCard(card, skills) : null}
+            onSend={(v) => {
+              const out = responder().value(card, v);
+              if (!out.ok) setError(out.message);
+            }}
+            onSkip={() => {
+              const out = responder().value(card, '');
+              if (!out.ok) setError(out.message);
+            }}
+            onInputFocus={revealField}
+          />
+        );
+      case 'vault-declined':
+        return <VaultDeclinedNote />;
     }
-    const text =
-      card.kind === 'vault-declined'
-        ? VAULT_NOTE
-        : card.status === 'cancelled' && card.cancelReason
-          ? `${UNSUPPORTED_NOTE} (${cancelLabel(card.cancelReason)})`
-          : UNSUPPORTED_NOTE;
-    return <MessageRow item={{ key: `req:${card.id}`, role: 'status', text }} />;
   }
 
   const showGreeting = ready && items.length === 0 && turn.requests.length === 0 && !error;
@@ -789,17 +920,23 @@ export default function ChatScreen() {
         </Animated.View>
       ) : (
         <FlatList
+          ref={listRef}
           data={reversedRows}
           inverted
+          onScroll={(e) => {
+            scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+          }}
+          scrollEventThrottle={16}
           keyExtractor={(r: Row) => (r.kind === 'item' ? r.item.key : `req:${r.card.id}`)}
           // 'interactive' is iOS-only; Android ignores it, so fall back to on-drag.
           keyboardDismissMode={process.env.EXPO_OS === 'ios' ? 'interactive' : 'on-drag'}
+          keyboardShouldPersistTaps={cardFieldFocused ? 'handled' : 'never'}
           // Inverted list: contentContainer paddingBottom is the visual top —
           // clearance for the floating header buttons.
           contentContainerStyle={{
             paddingHorizontal: 16,
             paddingTop: 12,
-            paddingBottom: insets.top + 64,
+            paddingBottom: headerClearance,
           }}
           renderItem={({ item: row }) => (
             // Entering-only fade (exiting animations orphan views — see
@@ -900,9 +1037,11 @@ export default function ChatScreen() {
       <Composer
         value={input}
         onChangeText={setInput}
+        mode={composerMode(turn, input.trim().length > 0, Boolean(stagedImage))}
         onSend={send}
+        onStop={() => void stop()}
+        onSteer={() => void steer()}
         disabled={!ready}
-        streaming={busy}
         stagedImageUri={stagedImage?.uri ?? null}
         onAttachPress={() => router.push('/attach')}
         onRemoveImage={() => setStagedImage(null)}

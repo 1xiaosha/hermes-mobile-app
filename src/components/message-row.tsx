@@ -2,7 +2,6 @@ import { memo, useState } from 'react';
 import { ActivityIndicator, LayoutAnimation, Pressable, Share, Text, View } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { Image } from 'expo-image';
-import type { ApprovalInfo } from '@/components/approval-card';
 import { Icon } from '@/components/icon';
 import { MarkdownView } from '@/components/markdown-view';
 import { bubbleImageSize } from '@/lib/image-attach';
@@ -27,7 +26,7 @@ export interface ToolInfo {
 
 export interface ChatItem {
   key: string;
-  role: 'user' | 'assistant' | 'tool' | 'status' | 'approval' | 'subagent' | 'todo';
+  role: 'user' | 'assistant' | 'tool' | 'status' | 'subagent' | 'todo';
   text: string;
   /** Assistant messages render plain text while streaming, markdown once complete. */
   complete?: boolean;
@@ -35,9 +34,6 @@ export interface ChatItem {
    * collapsible disclosure above the prose. History-only (no live event yet). */
   reasoning?: string;
   tool?: ToolInfo;
-  /** Gateway approval request, attached like ToolInfo. Rendered by the chat
-   * screen via ApprovalCard (it owns the respond callback), not MessageRow. */
-  approval?: ApprovalInfo;
   /** Live subagent batch — rendered by the chat screen via SubagentMonitorCard. */
   subagent?: SubagentBatch;
   /** Current todo list — rendered by the chat screen via TodoCard. */
@@ -47,6 +43,10 @@ export interface ChatItem {
   /** Natural dimensions of the attached photo, for aspect-correct layout. */
   imageWidth?: number;
   imageHeight?: number;
+  /** User message delivered via session.steer into the running turn (spec §5.3). */
+  steered?: boolean;
+  /** Status rows with special rendering. 'stopped' = the turn ended with status "interrupted". */
+  marker?: 'stopped';
 }
 
 function ReasoningDisclosure({ text }: { text: string }) {
@@ -178,6 +178,8 @@ export const MessageRow = memo(function MessageRow({ item }: { item: ChatItem })
         ) : null}
         {item.text ? (
           <View
+            accessible
+            accessibilityLabel={item.steered ? `You steered: ${item.text}` : undefined}
             style={{
               maxWidth: '82%',
               backgroundColor: colors.userBubble,
@@ -190,6 +192,12 @@ export const MessageRow = memo(function MessageRow({ item }: { item: ChatItem })
             <Text selectable style={{ color: colors.text, fontSize: 17, lineHeight: 24 }}>
               {item.text}
             </Text>
+          </View>
+        ) : null}
+        {item.steered ? (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingTop: 4, paddingRight: 6 }}>
+            <Icon sf="arrow.turn.down.right" size={11} color={colors.textFaint} />
+            <Text style={{ color: colors.textFaint, fontSize: 12, fontWeight: '600' }}>Steered</Text>
           </View>
         ) : null}
       </View>
@@ -234,9 +242,21 @@ export const MessageRow = memo(function MessageRow({ item }: { item: ChatItem })
   }
 
   // Rendered by the chat screen (they own their components); render nothing here.
-  if (item.role === 'approval' || item.role === 'subagent' || item.role === 'todo') return null;
+  if (item.role === 'subagent' || item.role === 'todo') return null;
 
   // status
+  if (item.marker === 'stopped') {
+    return (
+      <View
+        accessible
+        accessibilityLabel="Response stopped"
+        style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6 }}
+      >
+        <Icon sf="stop.circle" size={13} color={colors.textDim} />
+        <Text style={{ color: colors.textDim, fontSize: 13, fontWeight: '600' }}>Stopped</Text>
+      </View>
+    );
+  }
   return (
     <Text style={{ color: colors.textFaint, fontSize: 12.5, paddingVertical: 3 }}>{item.text}</Text>
   );
