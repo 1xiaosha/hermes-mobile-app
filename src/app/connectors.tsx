@@ -7,9 +7,10 @@
 // the list offers Reload now (spec §5.7).
 import { Stack, router, useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { Alert, FlatList, RefreshControl, Text, View } from 'react-native';
+import { Alert, FlatList, Pressable, RefreshControl, Text, View } from 'react-native';
 import { listMcpServers, setMcpServerEnabled, type McpServer } from '@/api/mcp';
 import type { McpRuntimeRow } from '@/api/mcpSession';
+import { CardButton } from '@/components/card-button';
 import { ConnectorReloadBanner } from '@/components/connector-reload-banner';
 import { ConnectorRow } from '@/components/connector-row';
 import { Icon } from '@/components/icon';
@@ -19,6 +20,7 @@ import { getProfileState, subscribeProfiles } from '@/profile-store';
 import {
   clearMcpChanged,
   getMcpChangePending,
+  mcpChangeMark,
   getSessionMcpTarget,
   markMcpChanged,
   subscribeMcpChange,
@@ -51,6 +53,7 @@ export default function ConnectorsScreen() {
   const readGen = useRef(0);
   const readsInFlight = useRef(0);
   const switching = useRef(new Set<string>());
+  const reloadLatch = useRef(false); // one alert, one reload: from the press until it ends
 
   /** Show a failure; returns its kind so the caller can react. `keepError`: a message is
    * already on screen for the action that led here (a failed switch) — leave it. */
@@ -112,6 +115,7 @@ export default function ConnectorsScreen() {
   useFocusEffect(
     useCallback(() => {
       setError(null);
+      setReloadNote(null); // a change may have been made on another screen since
       void fetchList();
     }, [fetchList]),
   );
@@ -135,6 +139,7 @@ export default function ConnectorsScreen() {
       readGen.current += 1; // a read already in flight predates this write: drop its result
       const enabling = !server.enabled;
       setError(null);
+      setReloadNote(null); // "Reloaded." is about the state before this change
       replaceServer(server.name, { ...server, enabled: enabling });
       let failed: ReturnType<typeof fail> | null = null;
       try {
@@ -157,10 +162,15 @@ export default function ConnectorsScreen() {
   /** Reload the gateway's connectors over the chat socket. The alert has already asked. */
   const runReload = useCallback(async () => {
     const t = getSessionMcpTarget();
-    if (!t?.connected || t.streaming) return;
+    if (!t?.connected || t.streaming) {
+      reloadLatch.current = false;
+      return;
+    }
+    const mark = mcpChangeMark(); // a change made while the reload runs must stay pending
     setReloading(true);
     setReloadNote(null);
     const outcome = await t.reload();
+    reloadLatch.current = false;
     setReloading(false);
     if (outcome.kind === 'error') {
       setReloadNote({ tone: 'error', text: outcome.message });
@@ -172,7 +182,7 @@ export default function ConnectorsScreen() {
         text: 'The connection dropped during the reload, so its result is unknown. Check the status lines.',
       });
     } else {
-      clearMcpChanged();
+      clearMcpChanged(mark);
       setReloadNote({ tone: 'info', text: outcome.thisChatOnly ? 'Reloaded for this chat only.' : 'Reloaded.' });
     }
     void fetchList(); // the list and the status lines, as the gateway has them now
@@ -180,13 +190,19 @@ export default function ConnectorsScreen() {
 
   /** A reload reaches every open chat and drops their prompt cache, so ask first. */
   const confirmReload = useCallback(() => {
+    if (reloadLatch.current) return;
+    reloadLatch.current = true;
+    const release = () => {
+      reloadLatch.current = false;
+    };
     Alert.alert(
       'Reload connectors?',
       'This reconnects every connector for every open chat on the gateway, including a chat that is mid-turn on another device. The next message in each chat re-sends the whole conversation, so it costs more.',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: 'Cancel', style: 'cancel', onPress: release },
         { text: 'Reload', onPress: () => void runReload() },
       ],
+      { onDismiss: release }, // Android: dismissed by tapping outside
     );
   }, [runReload]);
 
@@ -207,7 +223,24 @@ export default function ConnectorsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.bg }}>
-      <Stack.Screen options={{ title: 'Connectors' }} />
+      <Stack.Screen
+        options={{
+          title: 'Connectors',
+          headerRight: unsupported
+            ? undefined
+            : () => (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Add connector"
+                  hitSlop={4}
+                  onPress={() => router.push('/connectors/add')}
+                  style={({ pressed }) => ({ padding: 10, opacity: pressed ? 0.5 : 1 })}
+                >
+                  <Icon sf="plus" size={22} color={colors.accent} />
+                </Pressable>
+              ),
+        }}
+      />
 
       {error ? (
         <Text selectable style={{ color: colors.danger, fontSize: 14, paddingHorizontal: 16, paddingTop: 8 }}>
@@ -273,8 +306,9 @@ export default function ConnectorsScreen() {
               <Icon sf="powerplug" size={44} color={colors.textFaint} />
               <Text style={{ color: colors.text, fontSize: 18, fontWeight: '600' }}>No connectors yet</Text>
               <Text style={{ color: colors.textDim, fontSize: 14, textAlign: 'center' }}>
-                MCP servers configured on your gateway show up here.
+                Connectors give the agent on your gateway more tools. Add one from the catalog or by URL.
               </Text>
+              <CardButton label="Add a connector" a11y="Add a connector" onPress={() => router.push('/connectors/add')} primary />
             </View>
           ) : null
         }

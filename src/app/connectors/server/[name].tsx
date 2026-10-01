@@ -1,23 +1,33 @@
 // src/app/connectors/server/[name].tsx
 //
-// One MCP connector (spec §5.3): what it is, its on/off switch, and Test.
+// One MCP connector (spec §5.3): what it is, its on/off switch, Test, Sign in and Remove.
 // Test really connects on the gateway, over the active chat's socket. Only
 // the latest test counts: a result that arrives after a newer one started is
 // dropped. Remote servers are tested when the screen opens; a local (stdio)
 // one only on demand, because a test starts its process on the gateway.
-import { Stack, router, useLocalSearchParams } from 'expo-router';
+//
+// Sign in, the switch and Remove never overlap: the gateway snapshots the connector's
+// config when a sign-in starts and saves that snapshot when it ends, which would silently
+// undo a switch made in between. A sign-in owns the screen until it ends; so does a removal.
+import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { RefreshControl, ScrollView, Switch, Text, View } from 'react-native';
-import { listMcpServers, setMcpServerEnabled, type McpServer } from '@/api/mcp';
+import { Alert, Pressable, RefreshControl, ScrollView, Switch, Text, View } from 'react-native';
+import { listMcpServers, removeMcpServer, setMcpServerEnabled, type McpServer } from '@/api/mcp';
 import type { McpRuntimeRow } from '@/api/mcpSession';
+import { consumeSignInRequest, dropSignInRequest, gatewayBaseUrl, useConnectorSignIn } from '@/components/connector-sign-in';
+import { ConnectorSignInCard, type ConnectorSignInNote } from '@/components/connector-sign-in-card';
 import { ConnectorTestCard, type ConnectorTestState } from '@/components/connector-test-card';
 import { Icon } from '@/components/icon';
 import { withAuthRetry } from '@/connection';
 import {
   authLabel,
   connectorError,
+  explainOauthRefusal,
+  removeConfirmation,
   runtimeRowsByName,
   serverCapabilities,
+  signInLabel,
+  signInProblem,
   statusLine,
   type ConnectorAction,
 } from '@/lib/mcp';
@@ -84,12 +94,42 @@ export default function ConnectorDetailScreen() {
   // drops every read that started before it.
   const readGen = useRef(0);
   const readsInFlight = useRef(0);
+  const { phase: signInPhase, cancelling, signIn, cancel: cancelSignIn } = useConnectorSignIn(profile);
+  const signingIn = signInPhase !== null;
+  const [signInNote, setSignInNote] = useState<ConnectorSignInNote | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const signInChecked = useRef(false);
+  // After an await, a screen that was left must not navigate or write: `dismissTo` would
+  // replace whatever route is current by then.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      // A "sign in on open" request this screen could not use (its read failed, or the
+      // connector is not OAuth) must not start a sign-in on some later visit.
+      if (typeof name === 'string') dropSignInRequest(name);
+    };
+  }, [name]);
+  // A late answer may navigate only while this screen is the one he is looking at. Mounted is
+  // not enough: a chat pushed on top (a notification tap) leaves this screen mounted, and
+  // `dismissTo` would then pop that chat.
+  const focused = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      focused.current = true;
+      return () => {
+        focused.current = false;
+      };
+    }, []),
+  );
 
   /** `keepError`: a message is already on screen for the action that led here — leave it. */
   const fail = useCallback((e: unknown, action: ConnectorAction, keepError = false) => {
     const mapped = connectorError(e, action);
-    if (mapped.kind === 'auth') router.replace('/');
-    else if (!keepError) setError(mapped.message);
+    if (mapped.kind === 'auth') {
+      if (mounted.current) router.replace('/');
+    } else if (!keepError) setError(mapped.message);
     return mapped.kind;
   }, []);
 
@@ -156,12 +196,60 @@ export default function ConnectorDetailScreen() {
         return t.test(name, profile);
       })
       .then((outcome) => {
-        if (seq === testSeq.current) setTest({ phase: 'done', outcome });
+        if (seq !== testSeq.current) return;
+        setTest({ phase: 'done', outcome });
+        // This test is newer than any sign-in that failed before it: that failure's note may
+        // no longer be true (the provider's settings were changed in between).
+        setSignInNote((note) => (note?.tone === 'error' ? null : note));
       });
   }, [name, profile]);
 
+  /** Run a sign-in. It owns the screen until it ends; its result replaces any test's. */
+  const startSignIn = useCallback(() => {
+    if (typeof name !== 'string') return Promise.resolve();
+    testSeq.current += 1; // a test already in flight must not overwrite what follows
+    return Promise.resolve()
+      .then(() => {
+        setTest({ phase: 'idle' }); // that superseded test will never report: do not leave "Testing…"
+        setSignInNote(null);
+        return signIn(name);
+      })
+      .then((outcome) => {
+        if (!mounted.current) return;
+        if (outcome.kind === 'approved') {
+          testSeq.current += 1;
+          setTest({
+            phase: 'done',
+            outcome: { kind: 'ok', tools: outcome.tools, prompts: 0, resources: 0, tokensPresent: true },
+          });
+          setSignInNote({ tone: 'info', text: 'Signed in.' });
+          markMcpChanged(); // the running gateway reconnects it only if it was already loaded
+        } else if (outcome.kind === 'cancelled') {
+          setSignInNote({ tone: 'info', text: 'Sign-in cancelled.' });
+          void runTest(); // a sign-in that did complete on the gateway still shows
+        } else {
+          setSignInNote({ tone: 'error', ...signInProblem(outcome.message, gatewayBaseUrl(), name) });
+        }
+        void fetchServer(true); // the gateway re-saves the connector when a sign-in ends
+      })
+      .catch((e: unknown) => {
+        if (mounted.current) fail(e, 'signin');
+      });
+  }, [name, signIn, runTest, fetchServer, fail]);
+
   const caps = server ? serverCapabilities(server) : null;
   const autoTest = caps?.autoTest ?? false;
+  const canSignIn = caps?.canSignIn ?? false;
+
+  // An add screen asked for a sign-in as soon as this connector opens (a one-shot, in memory).
+  // Declared before the automatic test so that test is skipped: the sign-in's result replaces it.
+  useEffect(() => {
+    if (!canSignIn || signInChecked.current || typeof name !== 'string') return;
+    signInChecked.current = true;
+    if (!consumeSignInRequest(name)) return;
+    autoTested.current = true;
+    void startSignIn();
+  }, [canSignIn, name, startSignIn]);
 
   // Remote connectors are tested once, as soon as both the server and a chat socket are known.
   useEffect(() => {
@@ -172,7 +260,7 @@ export default function ConnectorDetailScreen() {
 
   /** Optimistic on/off — flip immediately, revert if the gateway says no. */
   async function toggle(current: McpServer) {
-    if (busy) return;
+    if (busy || signingIn || removing) return;
     const hadRead = readsInFlight.current > 0;
     readGen.current += 1; // a read already in flight predates this write: drop its result
     const enabling = !current.enabled;
@@ -195,7 +283,51 @@ export default function ConnectorDetailScreen() {
     if (failed || hadRead) void fetchServer(failed !== null);
   }
 
+  /** Remove the connector. The alert has already asked. */
+  async function remove(current: McpServer) {
+    if (busy || signingIn || removing) return;
+    readGen.current += 1; // a read already in flight predates this write: drop its result
+    setRemoving(true);
+    setError(null);
+    try {
+      await withAuthRetry((r) => removeMcpServer(r, current.name, profile));
+      markMcpChanged(); // the running gateway still has it loaded
+    } catch (e) {
+      if (!mounted.current) return;
+      const kind = fail(e, 'remove');
+      // `gone`: it was removed elsewhere in the meantime — the same end state, so leave as well.
+      if (kind !== 'gone') {
+        setRemoving(false);
+        if (kind !== 'auth') void fetchServer(true);
+        return;
+      }
+    }
+    if (focused.current) router.dismissTo('/connectors');
+    else if (mounted.current) {
+      // He is elsewhere: do not pull him back. When he returns this reads "Connector not found".
+      setRemoving(false);
+      void fetchServer(true);
+    }
+  }
+
+  function confirmRemove(current: McpServer) {
+    const { title, message } = removeConfirmation(current.name);
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => void remove(current) },
+    ]);
+  }
+
   const status = server && connected ? statusLine(server, row) : null;
+  const lastOutcome = test.phase === 'done' ? test.outcome : null;
+  // A test already shows that the provider refuses to register the gateway: the sign-in card
+  // says what to do (and gives the address to allow) without a sign-in attempt first. A
+  // finished test is never older than the stored note (a sign-in resets the test), so it wins.
+  const refusedTest =
+    canSignIn && lastOutcome && lastOutcome.kind !== 'ok' && typeof name === 'string' && explainOauthRefusal(lastOutcome.message)
+      ? signInProblem(lastOutcome.message, gatewayBaseUrl(), name)
+      : null;
+  const shownSignInNote: ConnectorSignInNote | null = refusedTest ? { tone: 'error', ...refusedTest } : signInNote;
 
   return (
     <ScrollView
@@ -226,7 +358,7 @@ export default function ConnectorDetailScreen() {
                   <Text style={{ color: colors.text, fontSize: 15.5 }}>Enabled</Text>
                   <Switch
                     value={server.enabled}
-                    disabled={busy}
+                    disabled={busy || signingIn || removing}
                     onValueChange={() => toggle(server)}
                     accessibilityLabel="Enabled"
                     trackColor={{ true: colors.accent }}
@@ -257,7 +389,52 @@ export default function ConnectorDetailScreen() {
             ) : null}
           </Card>
 
-          {caps.canTest ? <ConnectorTestCard state={test} connected={connected} onTest={() => void runTest()} /> : null}
+          {caps.canSignIn ? (
+            <ConnectorSignInCard
+              label={signInLabel(lastOutcome)}
+              phase={signInPhase}
+              cancelling={cancelling}
+              note={shownSignInNote}
+              disabled={busy || removing}
+              onSignIn={() => void startSignIn()}
+              onCancel={cancelSignIn}
+            />
+          ) : null}
+
+          {caps.canTest ? (
+            <ConnectorTestCard
+              state={test}
+              connected={connected}
+              disabled={signingIn || removing}
+              explainedAbove={refusedTest !== null}
+              onTest={() => void runTest()}
+            />
+          ) : null}
+
+          {caps.canRemove ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Remove connector"
+              accessibilityState={{ disabled: busy || signingIn || removing }}
+              disabled={busy || signingIn || removing}
+              onPress={() => confirmRemove(server)}
+              style={({ pressed }) => ({
+                minHeight: 44,
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: 12,
+                borderCurve: 'continuous',
+                borderWidth: 1,
+                borderColor: colors.border,
+                backgroundColor: pressed ? colors.surface : 'transparent',
+                opacity: busy || signingIn || removing ? 0.45 : 1,
+              })}
+            >
+              <Text style={{ color: colors.danger, fontSize: 15, fontWeight: '600' }}>
+                {removing ? 'Removing…' : 'Remove connector'}
+              </Text>
+            </Pressable>
+          ) : null}
 
           <Text style={{ color: colors.textFaint, fontSize: 12.5, marginHorizontal: 4 }}>
             {!caps.manageable

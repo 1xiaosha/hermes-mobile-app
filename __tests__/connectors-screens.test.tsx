@@ -23,11 +23,42 @@ jest.mock('../src/connection', () => ({
 }));
 const mockList = jest.fn();
 const mockSet = jest.fn();
+const mockRemove = jest.fn();
 jest.mock('../src/api/mcp', () => ({
   ...jest.requireActual('../src/api/mcp'),
   listMcpServers: (...a: unknown[]) => mockList(...a),
   setMcpServerEnabled: (...a: unknown[]) => mockSet(...a),
+  removeMcpServer: (...a: unknown[]) => mockRemove(...a),
 }));
+
+// The sign-in hook, with real `phase` state so the screen's busy rules can be seen. What a
+// sign-in answers is `mockSignIn`; the sequence itself is tested in mcp-oauth and connector-sign-in.
+const mockSignIn = jest.fn();
+const mockConsume = jest.fn();
+const mockDrop = jest.fn();
+jest.mock('../src/components/connector-sign-in', () => {
+  const React = jest.requireActual('react');
+  return {
+    useConnectorSignIn: () => {
+      const [phase, setPhase] = React.useState(null);
+      const signIn = React.useCallback(async (name: string) => {
+        setPhase('browser');
+        try {
+          return await mockSignIn(name);
+        } finally {
+          setPhase(null);
+        }
+      }, []);
+      const cancel = React.useCallback(() => {}, []);
+      return { phase, cancelling: false, signIn, cancel };
+    },
+    consumeSignInRequest: (name: string) => mockConsume(name),
+    dropSignInRequest: (name: string) => mockDrop(name),
+    requestSignInOnOpen: () => {},
+    gatewayBaseUrl: () => mockGatewayBase,
+  };
+});
+let mockGatewayBase: string | null = 'https://hermes.kite-opah.ts.net';
 
 function server(over: Partial<McpServer> = {}): McpServer {
   return {
@@ -92,6 +123,7 @@ async function open(url: string) {
       index: () => <Text>sign in</Text>,
       connectors: ConnectorsScreen,
       'connectors/server/[name]': ConnectorDetailScreen,
+      'chat/[id]': () => <Text>a chat</Text>,
     },
     { initialUrl: '/' },
   );
@@ -110,6 +142,11 @@ beforeEach(() => {
   alertSpy.mockClear();
   mockList.mockReset();
   mockSet.mockReset();
+  mockRemove.mockReset();
+  mockSignIn.mockReset();
+  mockConsume.mockReset();
+  mockDrop.mockReset();
+  mockConsume.mockReturnValue(false);
   mockList.mockImplementation(async () => [server(), local]);
 });
 
@@ -611,5 +648,528 @@ describe('Connector detail — reload', () => {
     await act(async () => fireEvent(screen.getByRole('switch'), 'valueChange', false));
     await flush(30);
     expect(getMcpChangePending()).toBe(false);
+  });
+});
+
+// --- Sign in and Remove on the detail (plan 3, task 5) -----------------------------------------
+
+describe('Connector detail — sign in', () => {
+  const signInButton = (label = 'Sign in') => screen.getByRole('button', { name: label });
+  const pressSignIn = (label = 'Sign in') =>
+    act(async () => {
+      void fireEvent.press(signInButton(label));
+    });
+
+  it('has no sign-in card for a connector that does not use OAuth, or comes from a plugin', async () => {
+    await open('/connectors/server/yt');
+    expect(screen.queryByRole('button', { name: /^Sign in/ })).toBeNull();
+    mockList.mockImplementation(async () => [server({ source: 'plugin', plugin: 'acme' })]);
+    await act(async () => router.replace('/connectors/server/linear' as never));
+    await flush();
+    expect(screen.queryByRole('button', { name: /^Sign in/ })).toBeNull();
+  });
+
+  it('says "Sign in again" only once a test has seen a token', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    expect(signInButton('Sign in')).toBeTruthy();
+    await act(async () => testCalls[0].resolve({ kind: 'ok', tools: [], prompts: 0, resources: 0, tokensPresent: true }));
+    await flush();
+    expect(signInButton('Sign in again')).toBeTruthy();
+  });
+
+  it('approved: shows the tools as a passed test, says Signed in, re-reads the connector and marks a reload as pending', async () => {
+    await open('/connectors/server/linear');
+    const reads = mockList.mock.calls.length;
+    mockSignIn.mockResolvedValue({ kind: 'approved', tools: [{ name: 'search', description: 'Search issues' }] });
+    await pressSignIn();
+    await flush(20);
+    expect(mockSignIn).toHaveBeenCalledWith('linear');
+    expect(screen.getByText('Working · 1 tool')).toBeTruthy();
+    expect(screen.getByText('search')).toBeTruthy();
+    expect(screen.getByText('Signed in.')).toBeTruthy();
+    expect(getMcpChangePending()).toBe(true);
+    expect(mockList.mock.calls.length).toBe(reads + 1);
+  });
+
+  it('a test that was in flight when sign-in started cannot overwrite the sign-in result', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    expect(testCalls).toHaveLength(1); // the automatic test, still pending
+    mockSignIn.mockResolvedValue({ kind: 'approved', tools: [] });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText('Working · 0 tools')).toBeTruthy();
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: 'OLD TEST RESULT', oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.queryByText('OLD TEST RESULT')).toBeNull();
+    expect(screen.getByText('Working · 0 tools')).toBeTruthy();
+  });
+
+  it('a sign-in that fails while a test was in flight leaves Test usable, and shows why', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    expect(screen.getByText('Testing…')).toBeTruthy();
+    mockSignIn.mockResolvedValue({ kind: 'error', message: 'This provider only accepts pre-registered clients.' });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText('This provider only accepts pre-registered clients.')).toBeTruthy();
+    expect(screen.queryByText('Testing…')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Test connection' })).not.toBeDisabled();
+  });
+
+  it('cancelled: says so and runs a test, so a sign-in that did complete still shows', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: 'no token', oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    mockSignIn.mockResolvedValue({ kind: 'cancelled' });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText('Sign-in cancelled.')).toBeTruthy();
+    expect(testCalls).toHaveLength(2);
+    expect(getMcpChangePending()).toBe(false);
+  });
+
+  it('a connector that is gone: the note, then "Connector not found" after the re-read', async () => {
+    await open('/connectors/server/linear');
+    mockSignIn.mockImplementation(async () => {
+      mockList.mockImplementation(async () => [local]);
+      return { kind: 'error', message: 'This connector no longer exists.', gone: true };
+    });
+    await pressSignIn();
+    await flush(30);
+    expect(screen.getByText('Connector not found')).toBeTruthy();
+  });
+
+  it('a dead session during sign-in goes to the sign-in screen', async () => {
+    await open('/connectors/server/linear');
+    mockSignIn.mockRejectedValue(new AuthError('session expired'));
+    await pressSignIn();
+    await flush(20);
+    expect(pathname()).toBe('/');
+  });
+
+  it('while a sign-in runs, the switch, Test and Remove are disabled', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'ok', tools: [], prompts: 0, resources: 0, tokensPresent: false }));
+    await flush();
+    let finish!: (o: { kind: 'cancelled' }) => void;
+    mockSignIn.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    await pressSignIn();
+    await flush();
+    expect(screen.getByText('Waiting for you to finish in the browser…')).toBeTruthy();
+    expect(screen.getByRole('switch').props.disabled).toBe(true);
+    expect(screen.getByRole('button', { name: 'Test connection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Remove connector' })).toBeDisabled();
+    await act(async () => finish({ kind: 'cancelled' }));
+    await flush(20);
+    expect(screen.getByRole('switch').props.disabled).toBe(false);
+  });
+
+  it('opened by an add screen with a sign-in request: starts exactly one sign-in and no automatic test', async () => {
+    mockConsume.mockImplementation((name: string) => name === 'linear');
+    publishSessionMcpTarget(owner, target(true));
+    let finish!: (o: { kind: 'approved'; tools: [] }) => void;
+    mockSignIn.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    await open('/connectors/server/linear');
+    await flush(20);
+    expect(mockSignIn).toHaveBeenCalledTimes(1);
+    expect(testCalls).toHaveLength(0);
+    await act(async () => finish({ kind: 'approved', tools: [] }));
+    await flush(20);
+    expect(mockSignIn).toHaveBeenCalledTimes(1);
+    expect(mockConsume).toHaveBeenCalledTimes(1);
+  });
+
+  it('without a request it does not start a sign-in by itself', async () => {
+    await open('/connectors/server/linear');
+    await flush(20);
+    expect(mockSignIn).not.toHaveBeenCalled();
+  });
+});
+
+// Seen on the device (2026-10-01): the provider refused the gateway's redirect address and the
+// screen showed its raw JSON, twice.
+describe('Connector detail — a provider that refuses the gateway’s redirect address', () => {
+  const RAW =
+    'Registration failed: 400 {"error":"invalid_client_metadata","error_description":"redirect_uri is not allowed by the account configuration"}';
+  const EXPLAINED =
+    'The server’s sign-in does not allow this gateway’s redirect address. Add it to the server’s allowed redirect addresses, then sign in again. It said: “redirect_uri is not allowed by the account configuration”';
+  const OTHER_RAW = 'Registration failed: 403 {"message":"Dynamic registration is disabled"}';
+  const NO_TOKEN = { kind: 'failed' as const, message: 'OAuth authentication required — no token found.', oauthNeeded: true, tokensPresent: false };
+  const pressTest = () =>
+    act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Test connection' }));
+    });
+  const pressSignIn = () =>
+    act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Sign in' }));
+    });
+  const SUMMARY = 'Sign-in is not set up: the server does not allow this gateway’s redirect address.';
+  const ADDRESS = 'https://hermes.kite-opah.ts.net/api/mcp/oauth/callback/linear';
+
+  beforeEach(() => {
+    mockGatewayBase = 'https://hermes.kite-opah.ts.net';
+  });
+
+  it('a failed sign-in: the explanation and the address to allow, and none of the provider’s JSON', async () => {
+    await open('/connectors/server/linear');
+    mockSignIn.mockResolvedValue({ kind: 'error', message: RAW });
+    await act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Sign in' }));
+    });
+    await flush(20);
+    expect(screen.getByText(EXPLAINED)).toBeTruthy();
+    expect(screen.getByText(ADDRESS).props.selectable).toBe(true);
+    expect(screen.queryByText(/invalid_client_metadata/)).toBeNull();
+  });
+
+  it('a failed test alone: the sign-in card explains it once with the address; the test card has one line', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.getAllByText(EXPLAINED)).toHaveLength(1);
+    expect(screen.getAllByText(ADDRESS)).toHaveLength(1);
+    expect(screen.getAllByText(SUMMARY)).toHaveLength(1);
+    expect(screen.queryByText(/invalid_client_metadata/)).toBeNull();
+  });
+
+  it('both failed: still one explanation and one address', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    mockSignIn.mockResolvedValue({ kind: 'error', message: RAW });
+    await act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Sign in' }));
+    });
+    await flush(20);
+    await act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Test connection' }));
+    });
+    await flush();
+    await act(async () => testCalls[testCalls.length - 1].resolve({ kind: 'failed', message: RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.getAllByText(EXPLAINED)).toHaveLength(1);
+    expect(screen.getAllByText(ADDRESS)).toHaveLength(1);
+    expect(screen.getAllByText(SUMMARY)).toHaveLength(1);
+  });
+
+  it('a connector that cannot sign in here (from a plugin): only the test card’s line, no address', async () => {
+    mockList.mockImplementation(async () => [server({ source: 'plugin', plugin: 'acme' })]);
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.getByText(SUMMARY)).toBeTruthy();
+    expect(screen.queryByText(ADDRESS)).toBeNull();
+  });
+
+  it('a plain-HTTP gateway: says sign-in needs https, and gives no address to allow', async () => {
+    mockGatewayBase = 'http://100.64.0.1:9119';
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.getByText('Sign-in needs the gateway on an https:// address; providers do not accept a plain-HTTP redirect.')).toBeTruthy();
+    expect(screen.queryByText('Redirect address')).toBeNull();
+    expect(screen.queryByText(/Add it to the server/)).toBeNull();
+  });
+
+  it('a refusal for another reason: explained once with the provider’s words, in the sign-in card', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: OTHER_RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(
+      screen.getByText('The server refused to register this gateway for sign-in (HTTP 403). It said: “Dynamic registration is disabled”'),
+    ).toBeTruthy();
+    expect(screen.getByText('Sign-in is not set up: the server refused to register this gateway (HTTP 403).')).toBeTruthy();
+    expect(screen.getAllByText(/Dynamic registration is disabled/)).toHaveLength(1);
+    expect(screen.queryByText('Redirect address')).toBeNull();
+  });
+
+  it('with no sign-in card (from a plugin), the test card carries the provider’s words itself', async () => {
+    mockList.mockImplementation(async () => [server({ source: 'plugin', plugin: 'acme' })]);
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve({ kind: 'failed', message: OTHER_RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(
+      screen.getByText('Sign-in is not set up: the server refused to register this gateway (HTTP 403). It said: “Dynamic registration is disabled”'),
+    ).toBeTruthy();
+  });
+
+  it('a newer test replaces an older sign-in note: a cancelled sign-in does not hide the refusal', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    await act(async () => testCalls[0].resolve(NO_TOKEN));
+    await flush();
+    mockSignIn.mockResolvedValue({ kind: 'cancelled' });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText('Sign-in cancelled.')).toBeTruthy();
+    // The cancelled branch runs a test itself; it comes back refused.
+    await act(async () => testCalls[testCalls.length - 1].resolve({ kind: 'failed', message: RAW, oauthNeeded: true, tokensPresent: false }));
+    await flush();
+    expect(screen.getByText(EXPLAINED)).toBeTruthy();
+    expect(screen.getByText(ADDRESS)).toBeTruthy();
+    expect(screen.queryByText('Sign-in cancelled.')).toBeNull();
+  });
+
+  it('a refused sign-in, then the allow list is fixed and Test says something else: the old explanation goes', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    mockSignIn.mockResolvedValue({ kind: 'error', message: RAW });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText(EXPLAINED)).toBeTruthy();
+    await pressTest();
+    await flush();
+    // Still there while the test runs: nothing newer is known yet.
+    expect(screen.getByText(EXPLAINED)).toBeTruthy();
+    await act(async () => testCalls[testCalls.length - 1].resolve(NO_TOKEN));
+    await flush();
+    expect(screen.queryByText(EXPLAINED)).toBeNull();
+    expect(screen.queryByText(ADDRESS)).toBeNull();
+    expect(screen.getByText('OAuth authentication required — no token found.')).toBeTruthy();
+  });
+
+  it('an info note survives a later test that has nothing to say about sign-in', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    await open('/connectors/server/linear');
+    mockSignIn.mockResolvedValue({ kind: 'approved', tools: [] });
+    await pressSignIn();
+    await flush(20);
+    expect(screen.getByText('Signed in.')).toBeTruthy();
+    await act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Test connection' }));
+    });
+    await flush();
+    await act(async () => testCalls[testCalls.length - 1].resolve({ kind: 'ok', tools: [], prompts: 0, resources: 0, tokensPresent: true }));
+    await flush();
+    expect(screen.getByText('Signed in.')).toBeTruthy();
+  });
+});
+
+describe('Connector detail — remove', () => {
+  const removeButton = () => screen.getByRole('button', { name: 'Remove connector' });
+
+  async function pressRemove() {
+    await act(async () => {
+      await fireEvent.press(removeButton());
+    });
+  }
+  /** Press the alert's button with this label; the alert itself is mocked. */
+  async function answerAlert(label: string) {
+    const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const button = (call[2] ?? []).find((b) => b.text === label);
+    await act(async () => {
+      void button?.onPress?.();
+    });
+    await flush(20);
+  }
+
+  /** The detail on top of the list, as in the app. */
+  async function openFromList() {
+    await open('/connectors');
+    await act(async () => router.push('/connectors/server/linear' as never));
+    await flush();
+  }
+
+  it('asks first, saying what stays on the gateway; Cancel does nothing', async () => {
+    await openFromList();
+    await pressRemove();
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(alertSpy.mock.calls[0][0]).toBe('Remove linear?');
+    expect(alertSpy.mock.calls[0][1]).toMatch(/stay on the gateway/);
+    await answerAlert('Cancel');
+    expect(mockRemove).not.toHaveBeenCalled();
+    expect(pathname()).toBe('/connectors/server/linear');
+  });
+
+  it('on confirm it removes, marks a reload as pending and goes back to the list', async () => {
+    await openFromList();
+    mockRemove.mockResolvedValue({ ok: true });
+    mockList.mockImplementation(async () => [local]);
+    await pressRemove();
+    await answerAlert('Remove');
+    expect(mockRemove).toHaveBeenCalledWith({}, 'linear', null);
+    expect(pathname()).toBe('/connectors');
+    expect(getMcpChangePending()).toBe(true);
+  });
+
+  it('already removed elsewhere (404): goes back to the list as well', async () => {
+    await openFromList();
+    mockRemove.mockRejectedValue(new HttpError(404, "Server 'linear' not found"));
+    await pressRemove();
+    await answerAlert('Remove');
+    expect(pathname()).toBe('/connectors');
+  });
+
+  it('a failure shows the gateway reason and stays', async () => {
+    await openFromList();
+    mockRemove.mockRejectedValue(new HttpError(409, "Server 'linear' is provided by plugin 'acme' and cannot be modified"));
+    await pressRemove();
+    await answerAlert('Remove');
+    expect(screen.getByText("Server 'linear' is provided by plugin 'acme' and cannot be modified")).toBeTruthy();
+    expect(pathname()).toBe('/connectors/server/linear');
+    expect(removeButton()).not.toBeDisabled();
+    expect(getMcpChangePending()).toBe(false);
+  });
+
+  it('leaving while the removal is out: its late answer does not navigate', async () => {
+    await openFromList();
+    let finish!: (v: { ok: boolean }) => void;
+    mockRemove.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    await pressRemove();
+    await answerAlert('Remove');
+    await act(async () => router.dismissTo('/' as never));
+    await flush();
+    expect(pathname()).toBe('/');
+    await act(async () => finish({ ok: true }));
+    await flush(20);
+    expect(pathname()).toBe('/');
+  });
+
+  it('a local or plugin connector has no Remove', async () => {
+    await open('/connectors/server/yt');
+    expect(screen.queryByRole('button', { name: 'Remove connector' })).toBeNull();
+  });
+});
+
+describe('Connectors list — the reload note does not outlive the next change', () => {
+  it('"Reloaded." is gone once another change is made', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    markMcpChanged();
+    await open('/connectors');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    await act(async () => {
+      void (call[2] ?? []).find((b) => b.text === 'Reload')?.onPress?.();
+    });
+    await flush(20);
+    expect(screen.getByText('Reloaded.')).toBeTruthy();
+
+    mockSet.mockResolvedValue({ ok: true, name: 'linear', enabled: false });
+    await act(async () => fireEvent(screen.getAllByRole('switch')[0], 'valueChange', false));
+    await flush();
+    expect(screen.getByText('The agent doesn’t have your changes yet.')).toBeTruthy();
+    expect(screen.queryByText('Reloaded.')).toBeNull();
+  });
+
+  it('and it is gone when the list regains focus', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    markMcpChanged();
+    await open('/connectors');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    await act(async () => {
+      void (call[2] ?? []).find((b) => b.text === 'Reload')?.onPress?.();
+    });
+    await flush(20);
+    expect(screen.getByText('Reloaded.')).toBeTruthy();
+    await act(async () => router.push('/connectors/server/yt' as never));
+    await flush();
+    await act(async () => router.back());
+    await flush();
+    expect(screen.queryByText('Reloaded.')).toBeNull();
+  });
+});
+
+// --- branch review of the add flow and the reload ---------------------------------------------
+
+describe('Branch review: reload and remove against other things happening', () => {
+  async function confirmLastAlert(label: string) {
+    const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    await act(async () => {
+      void (call[2] ?? []).find((b) => b.text === label)?.onPress?.();
+    });
+  }
+
+  it('a reload does not clear a change made while it was running', async () => {
+    let finish!: (o: McpReloadOutcome) => void;
+    const t = target(true);
+    t.reload = () => new Promise<McpReloadOutcome>((resolve) => (finish = resolve));
+    publishSessionMcpTarget(owner, t);
+    markMcpChanged();
+    await open('/connectors');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    await confirmLastAlert('Reload');
+    await flush();
+    markMcpChanged(); // e.g. a connector removed on its detail while the reload was out
+    await act(async () => finish({ kind: 'reloaded', thisChatOnly: false }));
+    await flush(20);
+    expect(getMcpChangePending()).toBe(true);
+    expect(screen.getByText('The agent doesn’t have your changes yet.')).toBeTruthy();
+  });
+
+  it('two presses on Reload now ask once and reload once', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    markMcpChanged();
+    await open('/connectors');
+    await act(async () => {
+      void fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+      void fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    await flush();
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    await confirmLastAlert('Reload');
+    await flush(20);
+    expect(reloads).toBe(1);
+  });
+
+  it('after Cancel the button asks again', async () => {
+    publishSessionMcpTarget(owner, target(true));
+    markMcpChanged();
+    await open('/connectors');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    await confirmLastAlert('Cancel');
+    await flush();
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Reload now' }));
+    });
+    expect(alertSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('remove: a chat opened on top while it was out stays; the connector is gone when he returns', async () => {
+    await open('/connectors');
+    await act(async () => router.push('/connectors/server/linear' as never));
+    await flush();
+    let finish!: (v: { ok: boolean }) => void;
+    mockRemove.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Remove connector' }));
+    });
+    await confirmLastAlert('Remove');
+    await flush();
+    await act(async () => router.navigate('/chat/abc' as never));
+    await flush();
+    mockList.mockImplementation(async () => [local]);
+    await act(async () => finish({ ok: true }));
+    await flush(20);
+    expect(pathname()).toBe('/chat/abc');
+    expect(getMcpChangePending()).toBe(true);
+    await act(async () => router.back());
+    await flush();
+    expect(screen.getByText('Connector not found')).toBeTruthy();
+  });
+
+  it('a detail that leaves without having used its sign-in request drops it', async () => {
+    await open('/connectors');
+    await act(async () => router.push('/connectors/server/yt' as never));
+    await flush();
+    await act(async () => router.back());
+    await flush();
+    expect(mockDrop).toHaveBeenCalledWith('yt');
   });
 });

@@ -1,6 +1,6 @@
 // __tests__/mcp-oauth.test.ts
 import type { McpOauthFlow } from '../src/api/mcp';
-import { OauthPreflightError } from '../src/api/mcp';
+import { McpPreflightError } from '../src/api/mcp';
 import { AuthError, HttpError } from '../src/api/restClient';
 import {
   OAUTH_CONFLICT_RETRY_MS,
@@ -9,6 +9,7 @@ import {
   OAUTH_MAX_FAILED_POLLS,
   OAUTH_POLL_MS,
   OAUTH_TOTAL_LIMIT_MS,
+  oauthPhaseLine,
   runOauthSignIn,
   type OauthDeps,
   type OauthPhase,
@@ -215,12 +216,12 @@ describe('runOauthSignIn — start failures', () => {
   });
 
   it('a failed fast request is a list failure, not a missing connector', async () => {
-    const h = harness({ start: new OauthPreflightError(new HttpError(404, "Profile 'x' not found")) });
+    const h = harness({ start: new McpPreflightError(new HttpError(404, "Profile 'x' not found")) });
     expect(await runOauthSignIn(h.deps)).toEqual({ kind: 'error', message: "Profile 'x' not found" });
   });
 
   it('a timed-out fast request does not warn about a 5-minute refusal: no flow was started', async () => {
-    const h = harness({ start: new OauthPreflightError(new HttpError(0, 'request timed out after 20s')) });
+    const h = harness({ start: new McpPreflightError(new HttpError(0, 'request timed out after 20s')) });
     expect(await runOauthSignIn(h.deps)).toEqual({ kind: 'error', message: 'The gateway did not answer in time.' });
   });
 
@@ -434,5 +435,13 @@ describe('runOauthSignIn — Cancel and leaving the screen', () => {
     const h = harness({ cancelBeforePoll: 0, polls: [new TypeError('Network request failed')] });
     expect(await runOauthSignIn(h.deps)).toEqual({ kind: 'cancelled' });
     expect(h.log.cancels).toEqual(['f1']);
+  });
+});
+
+describe('oauthPhaseLine', () => {
+  it('says what is happening in each phase', () => {
+    expect(oauthPhaseLine('starting')).toBe('Starting sign-in…');
+    expect(oauthPhaseLine('browser')).toBe('Waiting for you to finish in the browser…');
+    expect(oauthPhaseLine('finishing')).toBe('Finishing sign-in…');
   });
 });

@@ -1,11 +1,12 @@
 // src/components/connector-test-card.tsx — the Test button and its result (spec §5.3).
 //
 // A failed test shows the gateway's error text. That text is NOT redacted by the
-// gateway (docs/contracts/mcp.md), so it is never logged and not selectable.
+// gateway (docs/contracts/mcp.md), so it is never logged and not selectable. A provider's
+// refusal to register the gateway for sign-in is put into words first (lib/mcp).
 import { ActivityIndicator, Text, View } from 'react-native';
 import type { McpTestOutcome } from '@/api/mcpSession';
 import { CardButton } from '@/components/card-button';
-import { testSummary } from '@/lib/mcp';
+import { testFailureLine, testSummary } from '@/lib/mcp';
 import { useTheme } from '@/theme';
 
 export type ConnectorTestState =
@@ -13,12 +14,12 @@ export type ConnectorTestState =
   | { phase: 'running' }
   | { phase: 'done'; outcome: McpTestOutcome };
 
-function Result({ outcome }: { outcome: McpTestOutcome }) {
+function Result({ outcome, explainedAbove }: { outcome: McpTestOutcome; explainedAbove: boolean }) {
   const { colors } = useTheme();
   if (outcome.kind !== 'ok') {
     return (
       <Text selectable={false} style={{ color: colors.danger, fontSize: 14 }}>
-        {outcome.message}
+        {testFailureLine(outcome.message, !explainedAbove)}
       </Text>
     );
   }
@@ -42,11 +43,17 @@ function Result({ outcome }: { outcome: McpTestOutcome }) {
 export function ConnectorTestCard({
   state,
   connected,
+  disabled = false,
+  explainedAbove = false,
   onTest,
 }: {
   state: ConnectorTestState;
   /** False while no chat socket is available: Test cannot run. */
   connected: boolean;
+  /** The screen is busy with something a test must not overlap (a sign-in, a removal). */
+  disabled?: boolean;
+  /** The sign-in card above already explains a refused registration: keep this one to a line. */
+  explainedAbove?: boolean;
   onTest: () => void;
 }) {
   const { colors } = useTheme();
@@ -63,7 +70,7 @@ export function ConnectorTestCard({
         gap: 12,
       }}
     >
-      <CardButton label="Test connection" a11y="Test connection" onPress={onTest} disabled={running || !connected} />
+      <CardButton label="Test connection" a11y="Test connection" onPress={onTest} disabled={running || !connected || disabled} />
       {!connected ? (
         <Text style={{ color: colors.textFaint, fontSize: 13 }}>
           Testing needs a connected chat. Go back to the chat, wait for it to connect, then return.
@@ -75,7 +82,7 @@ export function ConnectorTestCard({
           <Text style={{ color: colors.textDim, fontSize: 14 }}>Testing…</Text>
         </View>
       ) : null}
-      {state.phase === 'done' ? <Result outcome={state.outcome} /> : null}
+      {state.phase === 'done' ? <Result outcome={state.outcome} explainedAbove={explainedAbove} /> : null}
     </View>
   );
 }
