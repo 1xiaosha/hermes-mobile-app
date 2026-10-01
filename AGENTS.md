@@ -108,7 +108,11 @@ src/theme.ts      single source of color truth (warm cream light / charcoal dark
   `tool.start/complete` (payload key is `name`, NOT `tool_name`), `status.update`, `error`;
   server→client request cards arrive via the request router.
 - History: `GET /api/sessions/{id}/messages` returns raw session-DB rows — text lives in
-  `content` (string or parts array), never `text`. Use `messageText()`.
+  `content` (string or parts array), never `text`. Use `messageText()`. A turn stopped right
+  after a tool result is stored with the gateway's own closing assistant row ("Operation
+  interrupted…", exact texts in docs/contracts/sessions-extra.md); `historyToItems` turns it into
+  the "Stopped" marker. A stop at any other point cannot be told from the rows, so that marker
+  does not survive a reload.
 - Stop = `session.interrupt` (turn ends via `message.complete status:interrupted`); steer =
   `session.steer` mid-turn, falling back to `prompt.submit {queued:true}` when rejected (or
   4010). Turn state is server-driven (`turn-controller`), not set from the composer.
