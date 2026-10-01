@@ -44,6 +44,8 @@ src/app/          expo-router routes — THIS is the router root, not a top-leve
   settings.tsx    formSheet (gateway info, disconnect)
   dev-cards.tsx   __DEV__-only gallery of every turn-control/card state for sim screenshots
                   (`xcrun simctl openurl booted hermesmobileapp://dev-cards`); release redirects
+  connectors.tsx  MCP connectors on the gateway: list, on/off, status from the chat socket
+  connectors/server/[name].tsx  one connector: details, on/off, Test (over the chat socket)
 src/api/          transport, all unit-tested with injected fetch/socket
   cookieJar.ts    manual cookie store (RN fetch doesn't manage cookies)
   restClient.ts   login / ws-ticket / sessions / history
@@ -52,7 +54,8 @@ src/api/          transport, all unit-tested with injected fetch/socket
                   reconnect orchestrator, all handlers registered before connect
   mcp.ts          MCP connector REST calls (servers, OAuth flow, catalog); cleans errors of
                   secret values. Contract: docs/contracts/mcp.md
-  mcpSession.ts   connector RPCs over an injected call: mcp.servers.test / .status
+  mcpSession.ts   connector RPCs over an injected call: mcp.servers.test / .status, reload.mcp
+                  (always confirm:true, never `always` — it persists to the gateway's config.yaml)
 src/vendor/hermes-gateway/  upstream client + generated contract, pinned by
                   VENDORED.json (re-vendor: scripts/sync-gateway-contract.sh <tag>)
 src/connection.ts singleton glue: SecureStore persistence, withAuthRetry, mintGatewayUrl
@@ -65,6 +68,8 @@ src/lib/mcp.ts    pure connector logic (capabilities, status line, validation, e
 src/lib/mcp-oauth.ts connector OAuth sign-in sequence, I/O injected; cancels every flow it abandons
 src/components/   message rows, tool cards, composer, theme'd pieces
   approval-card / clarify-card / secure-entry-card  server→client request cards
+  connector-row / connector-test-card  the Connectors list row; the Test button + result
+  connector-reload-banner  "the agent doesn't have your changes yet" + Reload now
   sidebar-host.tsx Claude-style slide-over: wraps the Stack in root _layout;
                   custom Reanimated drawer (no @react-navigation/drawer — banned
                   since SDK 56). Active on /chat/* only; left edge opens it there.
@@ -72,7 +77,7 @@ src/components/   message rows, tool cards, composer, theme'd pieces
                   destinations, New chat pill — lives inside the drawer.
 src/sidebar-store.ts open/close state (useSyncExternalStore, like profile-store)
 src/session-mcp-store.ts the active chat lends its socket to the Connectors screens
-                  (owner-checked clear)
+                  (newest mounted chat wins); also the "connectors changed, reload pending" flag
 src/theme.ts      single source of color truth (warm cream light / charcoal dark,
                   terracotta accent, Georgia serif for wordmark + greetings)
 ```
