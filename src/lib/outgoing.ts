@@ -1,6 +1,7 @@
 import { DeliveryUnknownError, RpcError } from '../api/gatewayClient';
 import type { RpcMethods } from '../vendor/hermes-gateway';
 import { base64ByteLength, buildAttachParams, type PickedImage } from './image-attach';
+import { sessionReadiness } from './session-readiness';
 
 // Mobile memory/frame budget, not a claimed file.attach server limit.
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -69,8 +70,7 @@ export function fileSize(size?: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 export function snapshotBusy(s: LiveSnapshot): boolean {
-  // No running field is NOT proof of idle on older gateways.
-  return s.running !== false || Boolean(s.queued?.user) || Boolean(s.inflight?.streaming);
+  return sessionReadiness(s) !== 'idle' || Boolean(s.queued?.user);
 }
 
 /** A cancellable local FIFO fronts the gateway's non-cancellable, merging queue.
@@ -196,7 +196,7 @@ export class Outgoing {
     if (head.state === 'unknown') return;
     if (head.state === 'accepted') {
       if (s.queued?.user === text) return;
-      if (s.inflight?.user === text || s.running === false) {
+      if (!snapshotBusy(s)) {
         this.queue = this.queue.slice(1);
         this.changed();
       } else return;
@@ -206,6 +206,7 @@ export class Outgoing {
     const next = this.queue[0];
     if (!next || next.state !== 'pending') return;
     if (!allowSubmit) return;
+    if (sessionReadiness(s) === 'unknown') return;
     // If we already handed off a head, don't merge another prompt into its server slot.
     if (s.queued?.user) return;
     if (next.draft.image && snapshotBusy(s)) return;
@@ -213,7 +214,6 @@ export class Outgoing {
     try {
       const result = await this.submit(next.draft, sid, call);
       await this.persistAccepted(next, result.status);
-      if (result.status === 'streaming') this.queue = this.queue.filter((e) => e !== next);
     } catch (e) {
       next.state = deliveryUnknown(e)
         ? (next.draft.submitUnknown ? 'unknown' : 'upload_unknown') : 'error';

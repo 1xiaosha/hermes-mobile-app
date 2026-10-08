@@ -19,7 +19,7 @@ export function MessageQueue({ entries, remoteText, disabled, onCancel, onRestor
     <View style={{ paddingHorizontal: 16, paddingTop: 6 }}>
       <Text style={{ color: colors.textDim, fontSize: 13, paddingBottom: 4 }}>排队消息</Text>
       {paused ? (
-        <Pressable accessibilityRole="button" accessibilityLabel="继续队列 / Continue queue" disabled={disabled} onPress={onContinue} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8 }}>
+        <Pressable accessibilityRole="button" accessibilityLabel="继续队列" disabled={disabled} onPress={onContinue} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8 }}>
           <Icon sf="play.circle.fill" size={16} color={colors.accent} />
           <Text style={{ color: colors.text, fontSize: 14 }}>继续队列</Text>
         </Pressable>
@@ -39,11 +39,11 @@ export function MessageQueue({ entries, remoteText, disabled, onCancel, onRestor
                   {entry.error ? `：${entry.error}` : ''}
                 </Text>
               </View>
-              {entry.state === 'error' ? <Pressable accessibilityRole="button" accessibilityLabel={`Retry queued ${index + 1}`} disabled={disabled} onPress={() => onRetry(entry.id)} style={{ padding: 8 }}><Icon sf="arrow.clockwise" size={16} color={colors.text} /></Pressable> : null}
-              <Pressable accessibilityRole="button" accessibilityLabel={`Restore queued ${index + 1} to draft`} disabled={!editable} onPress={() => onRestore(entry.id)} style={{ padding: 8 }}>
+              {entry.state === 'error' ? <Pressable accessibilityRole="button" accessibilityLabel={`重试排队消息 ${index + 1}`} disabled={disabled} onPress={() => onRetry(entry.id)} style={{ padding: 8 }}><Icon sf="arrow.clockwise" size={16} color={colors.text} /></Pressable> : null}
+              <Pressable accessibilityRole="button" accessibilityLabel={`将排队消息 ${index + 1}恢复为草稿`} disabled={!editable} onPress={() => onRestore(entry.id)} style={{ padding: 8 }}>
                 <Icon sf="square.and.pencil" size={16} color={editable ? colors.text : colors.textFaint} />
               </Pressable>
-              <Pressable accessibilityRole="button" accessibilityLabel={`Cancel queued ${index + 1}`} disabled={!editable} onPress={() => onCancel(entry.id)} style={{ padding: 8 }}>
+              <Pressable accessibilityRole="button" accessibilityLabel={`取消排队消息 ${index + 1}`} disabled={!editable} onPress={() => onCancel(entry.id)} style={{ padding: 8 }}>
                 <Icon sf="xmark" size={14} color={editable ? colors.text : colors.textFaint} />
               </Pressable>
             </View>

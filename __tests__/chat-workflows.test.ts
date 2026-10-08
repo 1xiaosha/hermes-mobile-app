@@ -61,10 +61,10 @@ async function settle() { await act(async () => { for (let i = 0; i < 12; i++) a
 async function mount() {
   await render(React.createElement(ChatScreen));
   await settle();
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Add attachment' })).toBeEnabled());
+  await waitFor(() => expect(screen.getByRole('button', { name: '添加附件' })).toBeEnabled());
   await settle();
 }
-const input = () => screen.getByPlaceholderText(/Chat with Hermes|Steer Hermes/);
+const input = () => screen.getByPlaceholderText(/与 Hermes 对话|引导当前任务/);
 async function type(text: string) { await fireEvent.changeText(input(), text); }
 async function press(label: string) {
   const button = screen.getByRole('button', { name: label });
@@ -95,7 +95,17 @@ beforeEach(() => {
   Object.assign(mockSnapshot, { session_id: 'live', message_count: 0, messages: [], info: {}, running: false });
   mockGateway = createFakeGateway();
   mockGateway.responders['session.create'] = () => ({ session_id: 'live', stored_session_id: 'stored', info: {} });
-  mockGateway.responders['session.resume'] = () => ({ ...mockSnapshot });
+  mockGateway.responders['session.resume'] = (params) => {
+    const allowed = ['session_id', 'profile', 'cols', 'source', 'lazy', 'defer_history', 'omit_messages', 'eager_build', 'close_on_disconnect'];
+    if (Object.keys(params).some((key) => !allowed.includes(key))) return rpcErr(4000, 'unknown parameter');
+    if (!['stored', 'other'].includes(params.session_id)) return rpcErr(4007, 'Session not found');
+    return { ...mockSnapshot };
+  };
+  mockGateway.responders['session.activate'] = (params) => {
+    if (Object.keys(params).some((key) => !['session_id', 'profile', 'cols', 'omit_messages'].includes(key))) return rpcErr(4000, 'unknown parameter');
+    if (params.session_id !== 'live') return rpcErr(4001, 'Session not found');
+    return { ...mockSnapshot };
+  };
   mockGateway.responders['session.events.since'] = () => ({ events: [], latest_seq: 0, count: 0, truncated: false, epoch: 'e1' });
   mockGateway.responders['file.attach'] = (params) => ({ attached: true, ref_text: `@file:"${params.name}"`, path: '/host/a', name: params.name });
   mockGateway.responders['session.steer'] = (params) => ({ status: 'queued', text: params.text });
@@ -104,6 +114,40 @@ beforeEach(() => {
 });
 afterEach(async () => { await cleanup(); });
 
+test('strict pinned protocol: natural completion polls runtime activate and automatically hands off FIFO', async () => {
+  await mount(); await type('initial'); await press('发送消息');
+  mockGateway.responders['prompt.submit'] = (params) => {
+    mockSnapshot.queued = { user: params.text };
+    return { status: 'queued' };
+  };
+  await type('first'); await press('加入队列');
+  await type('second'); await press('加入队列');
+  await type('third'); await press('加入队列');
+  expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first']);
+  // Real prompt_turn.py emits complete BEFORE clearing running in finally.
+  await event('message.complete', { status: 'complete', text: 'done' });
+  expect(calls('prompt.submit')).toHaveLength(2);
+  expect(screen.queryByRole('button', { name: '继续队列' })).toBeNull();
+  mockSnapshot.queued = null;
+  mockSnapshot.inflight = { user: 'first', assistant: '', streaming: true };
+  await event('message.start');
+  await event('message.complete', { status: 'complete', text: 'first done' });
+  mockSnapshot.running = false;
+  mockSnapshot.status = 'idle';
+  // Keep old inflight until the projection catches up; no extra complete event.
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1600)); });
+  expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first', 'second']);
+  mockSnapshot.running = true; mockSnapshot.status = 'working'; mockSnapshot.queued = null;
+  mockSnapshot.inflight = { user: 'second', streaming: true };
+  await event('message.start');
+  await event('message.complete', { status: 'complete', text: 'second done' });
+  mockSnapshot.running = false; mockSnapshot.status = 'idle';
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1600)); });
+  expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first', 'second', 'third']);
+  expect(calls('session.activate').length).toBeGreaterThan(2);
+  expect(calls('session.activate').every((call) => JSON.stringify(call.params) === JSON.stringify({ session_id: 'live', omit_messages: true }))).toBe(true);
+  expect(calls('session.resume')).toHaveLength(0);
+});
 test('file-only multi-attachment send: failed upload preserves selections, retry creates only one user bubble', async () => {
   await mount(); await pickFiles([file(), file('预算 表.xlsx')]);
   expect(mockPicker).toHaveBeenCalledWith({ type: '*/*', multiple: true, copyToCacheDirectory: true });
@@ -112,12 +156,12 @@ test('file-only multi-attachment send: failed upload preserves selections, retry
     if (fail) { fail = false; return rpcErr(5028, 'upload failed'); }
     return { attached: true, ref_text: `@file:"${params.name}"`, path: '/host/a', name: params.name };
   };
-  await press('Send message');
-  expect(screen.getByRole('button', { name: 'Remove file 中文 报告.pdf' })).toBeOnTheScreen();
+  await press('发送消息');
+  expect(screen.getByRole('button', { name: '移除文件 中文 报告.pdf' })).toBeOnTheScreen();
   expect(messages().filter((m) => m.role === 'user')).toHaveLength(0);
-  await press('Send message');
+  await press('发送消息');
   expect(messages().filter((m) => m.role === 'user')).toHaveLength(1);
-  expect(screen.queryByRole('button', { name: 'Remove file 中文 报告.pdf' })).toBeNull();
+  expect(screen.queryByRole('button', { name: '移除文件 中文 报告.pdf' })).toBeNull();
   expect(calls('prompt.submit')[0].params).toMatchObject({ text: '@file:"中文 报告.pdf"\n@file:"预算 表.xlsx"', queued: true });
 });
 
@@ -127,26 +171,28 @@ test('cancel and oversize picker results preserve existing text and attachments'
   await act(async () => requestAttach('files')); await settle();
   await pickFiles([{ ...file('big.pdf'), size: 11 * 1024 * 1024 }]);
   expect(input().props.value).toBe('draft');
-  expect(screen.getByRole('button', { name: 'Remove file 中文 报告.pdf' })).toBeOnTheScreen();
-  await press('Remove file 中文 报告.pdf');
-  expect(screen.queryByRole('button', { name: 'Remove file 中文 报告.pdf' })).toBeNull();
+  expect(screen.getByRole('button', { name: '移除文件 中文 报告.pdf' })).toBeOnTheScreen();
+  await press('移除文件 中文 报告.pdf');
+  expect(screen.queryByRole('button', { name: '移除文件 中文 报告.pdf' })).toBeNull();
 });
 
 test('busy FIFO has one server handoff; local tail can be restored and cancelled', async () => {
-  await mount(); await type('initial'); await press('Send message');
+  await mount(); await type('initial'); await press('发送消息');
   expect(input().props.editable).toBe(true);
   mockGateway.responders['prompt.submit'] = (params) => { mockSnapshot.queued = { user: params.text }; return { status: 'queued' }; };
-  await type('first'); await press('加入队列 / Queue');
-  await type('second'); await press('加入队列 / Queue');
-  expect(screen.getByRole('button', { name: 'Cancel queued 1' })).toBeDisabled();
-  await press('Restore queued 2 to draft');
+  await type('first'); await press('加入队列');
+  await type('second'); await press('加入队列');
+  expect(screen.getByRole('button', { name: '取消排队消息 1' })).toBeDisabled();
+  await press('将排队消息 2恢复为草稿');
   expect(input().props.value).toBe('second');
-  await press('加入队列 / Queue'); await press('Cancel queued 2');
-  await type('third'); await press('加入队列 / Queue');
+  await press('加入队列'); await press('取消排队消息 2');
+  await type('third'); await press('加入队列');
   mockSnapshot.queued = null;
   mockSnapshot.inflight = { user: 'first', streaming: true };
   await event('message.start');
-  expect(screen.getByText('1. third')).toBeOnTheScreen();
+  expect(screen.getByText('1. first')).toBeOnTheScreen();
+  expect(screen.getByText('2. third')).toBeOnTheScreen();
+  expect(screen.getByRole('button', { name: '取消排队消息 1' })).toBeDisabled();
   expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first']);
   mockSnapshot.running = false; mockSnapshot.inflight = null;
   await event('message.complete');
@@ -155,26 +201,26 @@ test('busy FIFO has one server handoff; local tail can be restored and cancelled
 });
 
 test('Stop persists pause before interrupt and never auto-dispatches tail; Continue resumes it', async () => {
-  await mount(); await type('initial'); await press('Send message');
+  await mount(); await type('initial'); await press('发送消息');
   mockGateway.responders['prompt.submit'] = (params) => { mockSnapshot.queued = { user: params.text }; return { status: 'queued' }; };
-  await type('first'); await press('加入队列 / Queue');
-  await type('tail'); await press('加入队列 / Queue');
+  await type('first'); await press('加入队列');
+  await type('tail'); await press('加入队列');
   mockGateway.responders['session.interrupt'] = () => {
     const records = [...mockFiles.values()].filter((raw) => raw.startsWith('{"version"')).map((raw) => JSON.parse(raw));
     expect(records.some((record) => record.state.paused === true)).toBe(true);
     return { status: 'interrupted' };
   };
-  await press('Stop response');
+  await press('停止回复');
   mockSnapshot.running = false; mockSnapshot.queued = null;
   await event('message.complete', { status: 'interrupted' });
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1600)); });
   expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first']);
-  await press('继续队列 / Continue queue');
+  await press('继续队列');
   expect(calls('prompt.submit').map((call) => call.params.text)).toEqual(['initial', 'first', 'tail']);
 });
 
 test('interim/tool/final transcript has no duplicate assistant segment', async () => {
-  await mount(); await type('initial'); await press('Send message');
+  await mount(); await type('initial'); await press('发送消息');
   await event('message.delta', { text: 'comment' });
   await event('message.interim', { text: 'comment', already_streamed: true });
   await event('tool.start', { tool_id: 't', name: 'terminal' });
@@ -187,22 +233,22 @@ test('interim/tool/final transcript has no duplicate assistant segment', async (
 });
 
 test('steer ACK means accepted not consumed; rejection retains text without redirect or submit', async () => {
-  await mount(); await type('initial'); await press('Send message');
-  await type('correction'); await press('引导当前任务 / Steer');
+  await mount(); await type('initial'); await press('发送消息');
+  await type('correction'); await press('引导当前任务');
   expect(input().props.value).toBe('');
   expect(messages().some((m) => m.text === 'correction' && m.steered)).toBe(true);
   expect(screen.getByText('引导已接受，未确认消费；压缩时可能转入下一轮。')).toBeOnTheScreen();
   mockGateway.responders['session.steer'] = (params) => ({ status: 'rejected', text: params.text });
-  await type('rejected'); await press('引导当前任务 / Steer');
+  await type('rejected'); await press('引导当前任务');
   expect(input().props.value).toBe('rejected');
   expect(calls('session.redirect')).toHaveLength(0);
   expect(calls('prompt.submit')).toHaveLength(1);
 });
 
 test('unknown steer stays visible and blocked after reconnect, without redirect or auto-submit', async () => {
-  await mount(); await type('initial'); await press('Send message');
+  await mount(); await type('initial'); await press('发送消息');
   mockGateway.responders['session.steer'] = (_params, sock) => { setTimeout(() => sock.drop(), 0); return HOLD; };
-  await type('unknown correction'); await press('引导当前任务 / Steer');
+  await type('unknown correction'); await press('引导当前任务');
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1100)); });
   expect(input().props.value).toBe('unknown correction');
   expect(screen.getByText('引导结果未确认，无法凭同文快照确认；文字保留，不自动重发。')).toBeOnTheScreen();
@@ -213,16 +259,16 @@ test('unknown steer stays visible and blocked after reconnect, without redirect 
 });
 
 test('session switch restores unknown ACK and its local tail without repeated delivery', async () => {
-  await mount(); await type('initial'); await press('Send message');
+  await mount(); await type('initial'); await press('发送消息');
   mockGateway.responders['prompt.submit'] = (params, sock) => {
     mockSnapshot.queued = { user: params.text };
     setTimeout(() => sock.drop(), 0);
     return HOLD;
   };
-  await type('first'); await press('加入队列 / Queue');
+  await type('first'); await press('加入队列');
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1100)); });
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Add attachment' })).toBeEnabled());
-  await type('tail'); await press('加入队列 / Queue');
+  await waitFor(() => expect(screen.getByRole('button', { name: '添加附件' })).toBeEnabled());
+  await type('tail'); await press('加入队列');
   await cleanup();
   mockRouteId = 'other'; await mount();
   expect(screen.queryByText('1. first')).toBeNull();

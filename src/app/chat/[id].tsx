@@ -222,7 +222,7 @@ function ChatSession({ id }: { id: string }) {
     params: RpcMethods[M]['params'],
   ): Promise<RpcMethods[M]['result']> {
     const client = gw();
-    return client ? client.call(method, params) : Promise.reject(new RpcError('Not connected.', -1));
+    return client ? client.call(method, params) : Promise.reject(new RpcError('尚未连接。', -1));
   }
 
   // Stop / steer (spec §5.3). Created once, on first use from a handler (never during render —
@@ -236,7 +236,7 @@ function ChatSession({ id }: { id: string }) {
       turnState: () => readTurn().turn,
       // A's transport: session.resume on the stored id, updates liveIdRef + seeds the store.
       resumeStored: () =>
-        transportRef.current?.resumeStored() ?? Promise.reject(new RpcError('Not connected.', -1)),
+        transportRef.current?.resumeStored() ?? Promise.reject(new RpcError('尚未连接。', -1)),
       reconnect: (trigger) => orchestratorRef.current?.reconnect(trigger) ?? Promise.resolve(),
       setTimer: (fn, ms) => {
         const t = setTimeout(fn, ms);
@@ -481,7 +481,7 @@ function ChatSession({ id }: { id: string }) {
       // A subagent card is NOT sealed here: when the replay ring no longer reaches the turn's
       // anchor, the reconnect keeps the screen and the gap's subagent.* events continue the same
       // card (A1). It is sealed below once we know the turn is over or the reconnect gave up.
-      setReconnectNote(`Connection lost — reconnecting (${p.attempt}/${p.max})…`);
+      setReconnectNote(`连接中断，正在重连（${p.attempt}/${p.max})…`);
     } else if (p.kind === 'ready') {
       pinCardsAfterSequence();
       // A turn that finished while the socket was down never delivers message.complete
@@ -497,7 +497,7 @@ function ChatSession({ id }: { id: string }) {
       pinCardsAfterSequence();
       finalizeSubagents(); // gave up: nothing will update the card again
       setReconnectNote(null);
-      setError('Could not reconnect. Check your VPN or Wi-Fi, then reopen this chat.');
+      setError('重连失败，请检查 VPN 或 Wi-Fi 后重新打开会话。');
     }
   }
 
@@ -542,10 +542,10 @@ function ChatSession({ id }: { id: string }) {
         finalizeSubagents();
         const fx = completionEffects(status, !live);
         if (fx.stoppedMarker) {
-          const marker: ChatItem = { key: nextKey(), role: 'status', text: 'Stopped', marker: 'stopped' };
+          const marker: ChatItem = { key: nextKey(), role: 'status', text: '已停止', marker: 'stopped' };
           updateItems((prev) => appendStoppedMarker(prev, marker));
         } else if (status === 'error') {
-          setError(p?.error || 'The turn failed.');
+          setError(p?.error || '本轮任务失败。');
         }
         if (fx.successHaptic) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         if (live) void outbox.sync();
@@ -568,7 +568,7 @@ function ChatSession({ id }: { id: string }) {
       case 'tool.complete': {
         const p = e.payload as GatewayEventMap['tool.complete'] | undefined;
         if (p?.name === 'todo') {
-          if (!upsertTodo(p)) append('status', 'Todo update failed');
+          if (!upsertTodo(p)) append('status', '待办更新失败');
           break;
         }
         completeTool(p);
@@ -601,7 +601,7 @@ function ChatSession({ id }: { id: string }) {
         const p = e.payload as GatewayEventMap['error'] | undefined;
         setThinking(false);
         if (readTurn().turn === 'idle') finalizeSubagents();
-        setError(p?.message ?? 'agent error');
+        setError(p?.message ?? '智能体出错');
         break;
       }
     }
@@ -613,7 +613,7 @@ function ChatSession({ id }: { id: string }) {
       if (source === 'camera') {
         const perm = await ImagePicker.requestCameraPermissionsAsync();
         if (!perm.granted) {
-          throw new Error('Camera access is off. Enable it in Settings to take photos.');
+          throw new Error('相机权限未开启，请在系统设置中启用后拍照。');
         }
       }
       const options: ImagePicker.ImagePickerOptions = {
@@ -629,10 +629,10 @@ function ChatSession({ id }: { id: string }) {
       if (result.canceled) return null;
       const asset = result.assets[0];
       if (!asset?.base64) {
-        throw new Error('Could not read that image — try a different one.');
+        throw new Error('无法读取图片，请选择其他图片。');
       }
       if (base64ByteLength(asset.base64) > MAX_ATTACH_BYTES) {
-        throw new Error('That image is over 25 MB — the gateway cannot accept it.');
+        throw new Error('图片超过 25 MB，网关无法接收。');
       }
       return {
         uri: asset.uri,
@@ -700,9 +700,11 @@ function ChatSession({ id }: { id: string }) {
         return liveIdRef.current;
       },
       snapshot: async () => {
-        const res = await t.client.call('session.resume', withProfile({
-          session_id: liveIdRef.current!, omit_messages: true, inline_images: false,
-        }, profileRef.current));
+        // activate addresses a live runtime; resume addresses the stored conversation.
+        const params: RpcMethods['session.activate']['params'] = withProfile({
+          session_id: liveIdRef.current!, omit_messages: true,
+        }, profileRef.current);
+        const res = await t.client.call('session.activate', params);
         liveIdRef.current = res.session_id;
         // Same request-card withdrawal/Stop preservation rule as reconnect seeding.
         t.store.dispatch({ type: 'resume.seeded', running: resumeRunning(res), openRequestIds: res.open_requests?.map((r) => r.id) });
@@ -721,7 +723,7 @@ function ChatSession({ id }: { id: string }) {
         await hydrateProfileStore(); // no-op when sessions screen already ran
         profileRef.current = getProfileState().selected;
         const info = await connectionInfo();
-        if (!info) throw new Error('No gateway connection.');
+        if (!info) throw new Error('尚未连接网关。');
         scopeRef.current = { gateway: info.baseUrl, identity: info.deviceId ?? info.username };
         const restoredId = await outbox.initialize(new ChatJournal(journalScope(info.baseUrl, info.deviceId ?? info.username, profileRef.current, id)));
         if (restoredId) storedIdRef.current = restoredId;
@@ -745,7 +747,7 @@ function ChatSession({ id }: { id: string }) {
         if (!cancelledRef.current) {
           // start() never reports `failed`: a card its history load recorded is pinned here (finding 6).
           handlersRef.current?.pinCardsAfterSequence();
-          setError('Could not open a live session. Check your VPN or Wi-Fi.');
+          setError('无法打开会话，请检查 VPN 或 Wi-Fi。');
         }
       }
     })();
@@ -755,6 +757,7 @@ function ChatSession({ id }: { id: string }) {
     const sub = AppState.addEventListener('change', (next) => {
       if (cancelledRef.current || !started) return;
       if (next !== 'active') void outbox.save().catch(() => {});
+      if (next === 'active' && t.client.isOpen) void outbox.sync();
       if (shouldReconnect({ hasSocket: true, isOpen: t.client.isOpen, appState: next })) {
         // May join a failing start(): its caller already reports that failure (review M1).
         t.orchestrator.reconnect('foreground').catch(() => {});
@@ -813,7 +816,7 @@ function ChatSession({ id }: { id: string }) {
         const t = transportRef.current;
         const sid = liveIdRef.current;
         if (!t || !sid) {
-          return Promise.resolve({ kind: 'error', message: 'Not connected.' } as SwitchOutcome);
+          return Promise.resolve({ kind: 'error', message: '尚未连接。' } as SwitchOutcome);
         }
         return switchSessionModel(t.client.call.bind(t.client), {
           sessionId: sid,
@@ -864,8 +867,8 @@ function ChatSession({ id }: { id: string }) {
 
   function showExportSheet() {
     if (items.length === 0) return;
-    showActionSheet('Export conversation', [
-      { label: 'Text', onPress: () => void shareExport('text') },
+    showActionSheet('导出会话', [
+      { label: '文本', onPress: () => void shareExport('text') },
       { label: 'JSONL', onPress: () => void shareExport('jsonl') },
     ]);
   }
@@ -1002,7 +1005,7 @@ function ChatSession({ id }: { id: string }) {
             // Pre-rasterized at 3× from the lobehub HermesAgent.Text SVG —
             // expo-image's SVG coder mangles its evenodd paths.
             source={require('../../../assets/images/hermesagent-text.png')}
-            accessibilityLabel="Hermes Agent"
+            accessibilityLabel="Hermes 智能体"
             contentFit="contain"
             tintColor={colors.text}
             // 52×24 lockup; size 56 matches HermesAgent.Text.
@@ -1011,7 +1014,7 @@ function ChatSession({ id }: { id: string }) {
           <Text style={{ fontFamily: serif, color: colors.text, fontSize: 30, textAlign: 'center' }}>
             {greetingForHour(new Date().getHours())}
           </Text>
-          <Text style={{ color: colors.textFaint, fontSize: 14 }}>Messages run on your own gateway.</Text>
+          <Text style={{ color: colors.textFaint, fontSize: 14 }}>消息由你自己的网关处理。</Text>
         </Animated.View>
       ) : (
         <FlatList
@@ -1091,21 +1094,21 @@ function ChatSession({ id }: { id: string }) {
           gap: 10,
         }}
       >
-        <HeaderButton icon="line.3.horizontal" label="Open menu" onPress={openSidebar} />
+        <HeaderButton icon="line.3.horizontal" label="打开菜单" onPress={openSidebar} />
         <View style={{ flex: 1 }} />
         {items.length > 0 ? (
           <Animated.View entering={FadeIn.duration(200)}>
-            <HeaderButton icon="square.and.arrow.up" label="Export conversation" onPress={showExportSheet} />
+            <HeaderButton icon="square.and.arrow.up" label="导出会话" onPress={showExportSheet} />
           </Animated.View>
         ) : null}
         {id !== 'new' ? (
           <HeaderButton
             icon="square.and.pencil"
-            label="New chat"
+            label="新建会话"
             onPress={() => router.replace('/chat/new')}
           />
         ) : (
-          <HeaderButton icon="gearshape" label="Settings" onPress={() => router.push('/settings')} />
+          <HeaderButton icon="gearshape" label="设置" onPress={() => router.push('/settings')} />
         )}
       </View>
 
@@ -1125,6 +1128,13 @@ function ChatSession({ id }: { id: string }) {
         >
           {pending.error ?? error}
         </Animated.Text>
+      ) : null}
+      {pending.syncFailed ? (
+        <Pressable accessibilityRole="button" accessibilityLabel="重试队列同步"
+          onPress={() => outbox.retrySync()} style={{ flexDirection: 'row', gap: 6, paddingHorizontal: 16, paddingVertical: 8 }}>
+          <Icon sf="arrow.clockwise" size={16} color={colors.accent} />
+          <Text style={{ color: colors.text, fontSize: 14 }}>重试队列同步</Text>
+        </Pressable>
       ) : null}
       {!ready && !error && !reconnectNote && !showGreeting && items.length === 0 ? (
         <View style={{ paddingBottom: 10 }}>

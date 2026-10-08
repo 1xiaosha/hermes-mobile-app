@@ -49,6 +49,18 @@ async function setup(j = journal(), call = mockCall(), snapshot: LiveSnapshot = 
 }
 beforeEach(() => { mockFiles.clear(); mockDelete.mockClear(); });
 
+test('snapshot failure becomes a visible recovery state and stops automatic read retries', async () => {
+  const initial = state();
+  initial.queue = [{ id: 'tail', state: 'pending', draft: empty('tail') }];
+  const { box, call, readSnapshot } = await setup(journal(initial));
+  readSnapshot.mockRejectedValue(new Error('offline'));
+  await box.sync();
+  expect(box.getSnapshot().error).toMatch(/队列.*同步.*重试/);
+  expect(box.getSnapshot().polling).toBe(false);
+  await box.sync();
+  expect(readSnapshot).toHaveBeenCalledTimes(1);
+  expect(call).not.toHaveBeenCalled();
+});
 test('a same-text correction seed cannot clear an active steer that is later rejected', async () => {
   const { box, call } = await setup();
   const gate = deferred<{ status: 'rejected'; text: string }>();
@@ -103,7 +115,7 @@ test.each([{}, { running: true, inflight: { user: 'repeat' } }])(
   },
 );
 
-test('same-text unknown queue recovery never deletes resources, even if storage fails', async () => {
+test('same-text unknown queue recovery never deletes 个资源, even if storage fails', async () => {
   const uri = 'file:///private/hermes-outbox/assets/owned.pdf';
   mockFiles.set(uri, 'abc');
   const initial = state();

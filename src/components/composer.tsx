@@ -101,7 +101,7 @@ export function Composer({
             <View style={{ width: 64, height: 64 }}>
               <Image
                 source={{ uri: stagedImageUri }}
-                accessibilityLabel="Staged photo"
+                accessibilityLabel="待发送照片"
                 contentFit="cover"
                 style={{
                   width: 64,
@@ -112,7 +112,7 @@ export function Composer({
               />
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel="Remove photo"
+                accessibilityLabel="移除照片"
                 onPress={onRemoveImage}
                 disabled={sending}
                 hitSlop={12}
@@ -135,7 +135,8 @@ export function Composer({
             </View>
             {running ? (
               <Text style={{ color: colors.textFaint, fontSize: 12.5, alignSelf: 'center', marginLeft: 10, flexShrink: 1 }}>
-                Tap Send once Hermes finishes
+
+                本轮结束后可发送这张照片
               </Text>
             ) : null}
           </Animated.View>
@@ -154,7 +155,7 @@ export function Composer({
                   {file.error ? <Text numberOfLines={2} style={{ color: colors.danger, fontSize: 12 }}>{file.error}</Text> : null}
                 </View>
                 {file.status === 'reading' || file.status === 'uploading' ? <ActivityIndicator color={colors.accent} /> : null}
-                <Pressable accessibilityRole="button" accessibilityLabel={`Remove file ${file.name}`} disabled={sending} onPress={() => onRemoveFile?.(file.id)} hitSlop={6} style={{ width: 32, height: 32, alignItems: 'center', justifyContent: 'center' }}>
+                <Pressable accessibilityRole="button" accessibilityLabel={`移除文件 ${file.name}`} disabled={sending} onPress={() => onRemoveFile?.(file.id)} hitSlop={6} style={{ width: 32, height: 32, alignItems: 'center', justifyContent: 'center' }}>
                   <Icon sf="xmark" size={13} color={colors.textDim} />
                 </Pressable>
               </View>
@@ -170,7 +171,7 @@ export function Composer({
           }}
           editable={!disabled && !sending}
           multiline
-          placeholder={running ? 'Steer Hermes…' : 'Chat with Hermes'}
+          placeholder={running ? '引导当前任务…' : '与 Hermes 对话'}
           placeholderTextColor={colors.placeholder}
           style={{
             color: colors.text,
@@ -186,7 +187,7 @@ export function Composer({
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel="Add attachment"
+            accessibilityLabel="添加附件"
             onPress={onAttachPress}
             disabled={disabled || sending}
             hitSlop={6}
@@ -207,7 +208,7 @@ export function Composer({
           {modelName ? (
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel={`Model: ${modelName}. Change model`}
+              accessibilityLabel={`模型：${modelName}，更换模型`}
               onPress={onModelPress}
               disabled={sending}
               hitSlop={6}
@@ -233,7 +234,7 @@ export function Composer({
             <>
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={stopping ? 'Stopping response' : 'Stop response'}
+                accessibilityLabel={stopping ? '正在停止回复' : '停止回复'}
                 accessibilityState={{ disabled: !canStop, busy: stopping }}
                 onPress={onStop}
                 disabled={!canStop}
@@ -255,7 +256,7 @@ export function Composer({
                 {stopping ? (
                   <>
                     <ActivityIndicator size="small" color={colors.textDim} />
-                    <Text style={{ color: colors.textDim, fontSize: 14, fontWeight: '500' }}>Stopping…</Text>
+                    <Text style={{ color: colors.textDim, fontSize: 14, fontWeight: '500' }}>正在停止…</Text>
                   </>
                 ) : (
                   <Icon sf="stop.fill" size={13} color={colors.text} />
@@ -264,7 +265,7 @@ export function Composer({
               {hasText && !onQueue ? (
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="Send steer message"
+                  accessibilityLabel="发送引导消息"
                   accessibilityState={{ disabled: !canSteer }}
                   onPress={onSteer}
                   disabled={!canSteer}
@@ -285,7 +286,7 @@ export function Composer({
           ) : (
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Send message"
+              accessibilityLabel="发送消息"
               accessibilityState={{ disabled: !canSend }}
               onPress={onSend}
               disabled={!canSend}
@@ -305,11 +306,11 @@ export function Composer({
         </View>
         {running && onQueue ? (
           <View style={{ flexDirection: 'row', gap: 16, flexWrap: 'wrap' }}>
-            <Pressable accessibilityRole="button" accessibilityLabel="加入队列 / Queue" disabled={!canQueue} onPress={onQueue} style={{ minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <Pressable accessibilityRole="button" accessibilityLabel="加入队列" disabled={!canQueue} onPress={onQueue} style={{ minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
               <Icon sf="text.badge.plus" size={16} color={canQueue ? colors.text : colors.textFaint} />
               <Text style={{ color: canQueue ? colors.text : colors.textFaint, fontSize: 14 }}>加入队列</Text>
             </Pressable>
-            <Pressable accessibilityRole="button" accessibilityLabel="引导当前任务 / Steer" disabled={!canSteer} onPress={onSteer} style={{ minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <Pressable accessibilityRole="button" accessibilityLabel="引导当前任务" disabled={!canSteer} onPress={onSteer} style={{ minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
               <Icon sf="arrow.triangle.branch" size={16} color={canSteer ? colors.text : colors.textFaint} />
               <Text style={{ color: canSteer ? colors.text : colors.textFaint, fontSize: 14 }}>引导当前任务</Text>
             </Pressable>

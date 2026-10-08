@@ -87,6 +87,27 @@ describe('files and reliable delivery', () => {
 });
 
 describe('FIFO and steering', () => {
+  it.each([undefined, null, false])('drains an ACKed head on status idle with running=%s and retained inflight', async (running) => {
+    const { outgoing, call } = setup();
+    outgoing.enqueue(draft('first', []));
+    const photo = draft('photo', []);
+    photo.image = { uri: 'file:///photo.jpg', base64: 'YWJj' };
+    outgoing.enqueue(photo);
+    call.mockResolvedValueOnce({ status: 'queued' });
+    await outgoing.flush({ running: true }, 's', call);
+    await outgoing.flush({ running, status: 'idle', inflight: { user: 'older', streaming: true } }, 's', call);
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['prompt.submit', 'image.attach_bytes', 'prompt.submit']);
+    expect(outgoing.queue[0].draft.text).toBe('photo');
+    expect(outgoing.queue[0].state).toBe('accepted');
+    await outgoing.flush({ running: false, status: 'idle' }, 's', call);
+    expect(outgoing.queue).toHaveLength(0);
+  });
+  it('an unknown snapshot is not permission to hand off even a pending text', async () => {
+    const { outgoing, call } = setup();
+    outgoing.enqueue(draft('pending', []));
+    await outgoing.flush({}, 's', call);
+    expect(call).not.toHaveBeenCalled();
+  });
   it('keeps attachments bound to entries; cancel and restore preserve selection', () => {
     const { outgoing } = setup();
     const a = outgoing.enqueue(draft('a'));
@@ -106,7 +127,9 @@ describe('FIFO and steering', () => {
     await outgoing.flush(snapshot(true, 'a'), 's', call);
     expect(call).toHaveBeenCalledTimes(1);
     await outgoing.flush({ running: true, inflight: { user: 'a', streaming: true } }, 's', call);
-    expect(outgoing.queue.map((e) => e.draft.text)).toEqual(['b']);
+    expect(outgoing.queue.map((e) => e.draft.text)).toEqual(['a', 'b']);
+    expect(call).toHaveBeenCalledTimes(1);
+    await outgoing.flush({ running: true, inflight: { user: 'a', streaming: true } }, 's', call);
     expect(call).toHaveBeenCalledTimes(1);
     await outgoing.flush(snapshot(false), 's', call);
     expect(call.mock.calls[1][1]).toMatchObject({ text: 'b', queued: true });
@@ -116,13 +139,15 @@ describe('FIFO and steering', () => {
     const a = draft('photo', []);
     a.image = { uri: 'file:///photo.jpg', base64: 'YWJj' };
     outgoing.enqueue(a);
-    outgoing.enqueue(draft('file'));
+    const fileEntry = outgoing.enqueue(draft('file'));
     await outgoing.flush(snapshot(true), 's', call);
     expect(call).not.toHaveBeenCalled();
     await outgoing.flush(snapshot(false), 's', call);
     expect(call.mock.calls[0][0]).toBe('image.attach_bytes');
     expect(call.mock.calls[1][1]).toMatchObject({ text: 'photo', queued: true });
-    expect(outgoing.queue[0].draft.files[0].upload).toBeUndefined();
+    expect(fileEntry.draft.files[0].upload).toBeUndefined();
+    expect(outgoing.queue[0].draft).toBe(a);
+    expect(outgoing.queue[1]).toBe(fileEntry);
   });
   it('preserves an unknown submit despite same-text reconnect snapshots without a duplicate submit', async () => {
     const { outgoing, call } = setup();

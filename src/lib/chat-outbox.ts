@@ -27,6 +27,7 @@ export interface OutboxView {
   blocked: boolean;
   paused: boolean;
   polling: boolean;
+  syncFailed: boolean;
 }
 const emptyDraft = (): Draft => ({ text: '', image: null, files: [] });
 
@@ -42,6 +43,7 @@ export class ChatOutbox {
   private busy = false;
   private activeOperation: Promise<void> | null = null;
   private syncing = false;
+  private syncFailed = false;
   private paused = false;
   private disposed = false;
   private hydrated = false;
@@ -58,7 +60,7 @@ export class ChatOutbox {
     (draft, status, key) => this.accept(draft, status, key),
     () => this.save(),
   );
-  private view: OutboxView = { draft: this.draft, queue: [], sending: false, hydrated: false, error: null, steerNote: null, blocked: false, paused: false, polling: false };
+  private view: OutboxView = { draft: this.draft, queue: [], sending: false, hydrated: false, error: null, steerNote: null, blocked: false, paused: false, polling: false, syncFailed: false };
 
   getSnapshot = (): OutboxView => this.view;
   subscribe = (listener: () => void): (() => void) => {
@@ -75,7 +77,8 @@ export class ChatOutbox {
       remoteQueued: this.remoteQueued,
       paused: this.paused,
       blocked,
-      polling: Boolean(this.remoteQueued || blocked || (head && (
+      syncFailed: this.syncFailed,
+      polling: !this.syncFailed && Boolean(this.remoteQueued || blocked || (head && (
         head.state === 'accepted' || head.state === 'unknown' || head.draft.acceptedStatus ||
         (head.state === 'pending' && !this.paused)
       ))),
@@ -301,6 +304,12 @@ export class ChatOutbox {
   private needsSnapshot(): boolean {
     return this.view.polling;
   }
+  retrySync(): void {
+    this.syncFailed = false;
+    this.error = null;
+    this.publish();
+    void this.sync();
+  }
   async sync(): Promise<void> {
     const c = this.connection;
     if (this.busy || this.syncing || !this.needsSnapshot() || this.disposed) return;
@@ -308,9 +317,13 @@ export class ChatOutbox {
       await this.exclusive(() => this.settleDirectReceipt());
       return;
     }
-    if (!c?.connected() || !c.liveSession()) return;
+    if (!c?.connected()) return;
     this.syncing = true;
     try {
+      if (!c.liveSession()) {
+        await this.exclusive(async () => { await c.ensureSession(); });
+        if (!c.liveSession()) throw new Error('无法创建会话');
+      }
       const snapshot = await c.snapshot(); // Reading alone never locks the composer.
       if (this.disposed || this.busy) return;
       this.seed(snapshot);
@@ -324,7 +337,9 @@ export class ChatOutbox {
         if (before !== after) await this.save();
       }, false);
     } catch {
-      // A failed read never proves idle or enables a drain.
+      this.syncFailed = true;
+      this.error = '队列状态同步失败，消息与附件已保留；请检查连接后重试同步。';
+      this.publish();
     } finally { this.syncing = false; }
   }
   async steer(): Promise<void> {
