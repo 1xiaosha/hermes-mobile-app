@@ -98,7 +98,7 @@ jobs:
           )
           (
             cd .expo/ipa-artifacts
-            unzip -Z1 Hermes-Mobile-1.0.1-build2-unsigned.ipa | awk '/^Payload\/[^/]+\.app\/Info.plist$/ {found=1} END {exit !found}'
+            python3 -c 'import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); bad = z.testzip(); valid = any(len(p) == 3 and p[0] == "Payload" and len(p[1]) > 4 and p[1].endswith(".app") and p[2] == "Info.plist" for p in (name.split("/") for name in z.namelist())); z.close(); sys.exit(0 if bad is None and valid else "Invalid IPA: missing Payload/<name>.app/Info.plist or corrupt ZIP entry")' Hermes-Mobile-1.0.1-build2-unsigned.ipa
             shasum -a 256 Hermes-Mobile-1.0.1-build2-unsigned.ipa > Hermes-Mobile-1.0.1-build2-unsigned.ipa.sha256
             shasum -a 256 -c Hermes-Mobile-1.0.1-build2-unsigned.ipa.sha256
           )
