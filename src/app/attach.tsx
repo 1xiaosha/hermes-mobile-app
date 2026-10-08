@@ -8,6 +8,7 @@ import { withAuthRetry } from '@/connection';
 import { showProfilePicker } from '@/lib/profile-picker';
 import { activeProfileLabel, getProfileState, subscribeProfiles } from '@/profile-store';
 import { useTheme } from '@/theme';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export { RouteError as ErrorBoundary } from '@/components/route-error';
 
@@ -79,6 +80,7 @@ function Row({
  * then the chat's knobs (model, profile) and hermes destinations. */
 export default function AttachSheet() {
   const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
   const profiles = useSyncExternalStore(subscribeProfiles, getProfileState);
   const [modelName, setModelName] = useState<string | null>(null);
 
@@ -139,10 +141,11 @@ export default function AttachSheet() {
         <View style={{ width: 34 }} />
       </View>
 
-      <View style={{ padding: 14, gap: 14 }}>
+      <View style={{ padding: 14, paddingBottom: Math.max(14, insets.bottom), gap: 14 }}>
         <View style={{ flexDirection: 'row', gap: 10 }}>
           <Tile icon="camera.fill" label="Camera" onPress={() => attach('camera')} />
           <Tile icon="photo.on.rectangle" label="Photos" onPress={() => attach('library')} />
+          <Tile icon="doc.fill" label="文件 / Files" onPress={() => attach('files')} />
         </View>
 
         <View

@@ -9,6 +9,7 @@ import type { SubagentBatch } from '@/lib/subagent-progress';
 import type { ToolOutcome } from '@/lib/tool-outcome';
 import type { TodoItem } from '@/lib/todo';
 import { useTheme } from '@/theme';
+import { fileSize } from '@/lib/outgoing';
 
 export interface ToolInfo {
   id: string;
@@ -54,6 +55,7 @@ export interface ChatItem {
   /** Natural dimensions of the attached photo, for aspect-correct layout. */
   imageWidth?: number;
   imageHeight?: number;
+  files?: { name: string; size?: number }[];
   /** User message delivered via session.steer into the running turn (spec §5.3). */
   steered?: boolean;
   /** Status rows with special rendering. 'stopped' = the turn ended with status "interrupted". */
@@ -179,6 +181,15 @@ export const MessageRow = memo(function MessageRow({ item }: { item: ChatItem })
     const imageSize = item.imageUri ? bubbleImageSize(item.imageWidth, item.imageHeight) : null;
     return (
       <View style={{ alignItems: 'flex-end', paddingVertical: 6 }}>
+        {item.files?.map((file, i) => (
+          <View key={i} style={{ maxWidth: '82%', flexDirection: 'row', alignItems: 'center', gap: 8, padding: 10, marginBottom: 5, borderWidth: 1, borderColor: colors.border, borderRadius: 8 }}>
+            <Icon sf="doc" size={18} color={colors.textDim} />
+            <View style={{ flexShrink: 1 }}>
+              <Text style={{ color: colors.text, fontSize: 14 }}>{file.name}</Text>
+              <Text style={{ color: colors.textFaint, fontSize: 12 }}>{fileSize(file.size)}</Text>
+            </View>
+          </View>
+        ))}
         {item.imageUri && imageSize ? (
           <Image
             source={{ uri: item.imageUri }}
