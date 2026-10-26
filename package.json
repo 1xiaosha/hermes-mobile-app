@@ -1,11 +1,12 @@
 {
   "name": "hermes-mobile-app",
   "main": "expo-router/entry",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "dependencies": {
     "@expo/ui": "~57.0.21",
     "@expo/vector-icons": "^15.0.2",
     "expo": "~57.0.26",
+    "expo-audio": "~57.0.5",
     "expo-build-properties": "~57.0.22",
     "expo-camera": "~57.0.6",
     "expo-constants": "~57.0.20",

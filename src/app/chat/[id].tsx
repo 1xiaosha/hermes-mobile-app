@@ -38,7 +38,10 @@ import { SubagentMonitorCard } from '@/components/subagent-monitor-card';
 import { ThinkingDots } from '@/components/thinking-dots';
 import { TodoCard } from '@/components/todo-card';
 import { VaultDeclinedNote } from '@/components/vault-declined-note';
-import { connectionInfo, mintGatewayUrl, withAuthRetry } from '@/connection';
+import { connectionInfo, getRest, mintGatewayUrl, withAuthRetry } from '@/connection';
+import { MessageMediaProvider, type MediaOwner } from '@/components/message-media';
+import { captureMediaOwner } from '@/lib/media-owner';
+import type { RestClient } from '@/api/restClient';
 import { getProfileState, hydrateProfileStore } from '@/profile-store';
 import { openSidebar } from '@/sidebar-store';
 import { showActionSheet } from '@/lib/action-sheet';
@@ -175,6 +178,7 @@ function ChatSession({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [reconnectNote, setReconnectNote] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [mediaOwner, setMediaOwner] = useState<MediaOwner | null>(null);
   const [pill, setPill] = useState<ModelPillState>(() =>
     withFallbackModel(emptyModelPill(), cachedModelId),
   );
@@ -194,6 +198,7 @@ function ChatSession({ id }: { id: string }) {
   // for this chat even if the user switches profiles elsewhere mid-session.
   const profileRef = useRef<string | null>(getProfileState().selected);
   const scopeRef = useRef<{ gateway: string; identity: string } | null>(null);
+  const mediaRestRef = useRef<RestClient | null>(null);
   const keyCounter = useRef(0);
   const activeSubagentKeyRef = useRef<string | null>(null);
   const todoKeyRef = useRef<string | null>(null);
@@ -688,6 +693,9 @@ function ChatSession({ id }: { id: string }) {
           const created = await t.client.call('session.create', withProfile({}, profileRef.current));
           liveIdRef.current = created.session_id;
           storedIdRef.current = created.stored_session_id ?? created.session_id;
+          if (created.stored_session_id && mediaRestRef.current) setMediaOwner(captureMediaOwner(
+            mediaRestRef.current, profileRef.current, created.stored_session_id, scopeRef.current?.identity ?? '',
+          ));
           setPill((p) => withResumedModel(p, created.info));
           if (id === 'new') {
             startedDraftRef.current = storedIdRef.current;
@@ -724,9 +732,13 @@ function ChatSession({ id }: { id: string }) {
         profileRef.current = getProfileState().selected;
         const info = await connectionInfo();
         if (!info) throw new Error('尚未连接网关。');
+        mediaRestRef.current = getRest();
         scopeRef.current = { gateway: info.baseUrl, identity: info.deviceId ?? info.username };
         const restoredId = await outbox.initialize(new ChatJournal(journalScope(info.baseUrl, info.deviceId ?? info.username, profileRef.current, id)));
         if (restoredId) storedIdRef.current = restoredId;
+        if (id !== 'new' || restoredId) setMediaOwner(captureMediaOwner(
+          mediaRestRef.current, profileRef.current, restoredId ?? id, info.deviceId ?? info.username,
+        ));
         let historyLoaded = false;
         if (id !== 'new') {
           storedIdRef.current = id;
@@ -986,6 +998,7 @@ function ChatSession({ id }: { id: string }) {
   }));
 
   return (
+    <MessageMediaProvider owner={mediaOwner}>
     <Animated.View style={[{ flex: 1, backgroundColor: colors.bg }, containerStyle]}>
       {showGreeting ? (
         <Animated.View
@@ -1167,5 +1180,6 @@ function ChatSession({ id }: { id: string }) {
         onModelPress={() => router.push('/models?scope=session')}
       />
     </Animated.View>
+    </MessageMediaProvider>
   );
 }

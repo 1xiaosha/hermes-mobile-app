@@ -2,6 +2,8 @@
 import { SESSION_CLAIM_ROUTE } from '@/lib/push';
 import { CookieJar } from './cookieJar';
 import type { MessagesResponse, SessionListResponse, WsTicketResponse } from './types';
+import type { MessageMedia } from '@/lib/message-media';
+import { MAX_MEDIA_BYTES, validateMediaBytes, type MediaBytes } from '@/lib/media-bytes';
 
 export class AuthError extends Error {}
 export class HttpError extends Error {
@@ -66,6 +68,8 @@ export class RestClient {
     // which would leave the next launch replaying the rotated-out token and
     // (server-side) getting the device revoked. Best-effort; never rejects.
     private readonly flushCookiePersist?: () => Promise<void>,
+    // Runtime supplies expo/fetch: native streaming + redirect:'error'. Tests inject HTTP I/O.
+    private readonly mediaFetchFn: FetchFn = fetchFn,
   ) {}
 
   // Serializes authed requests. Refresh tokens rotate single-use server-side:
@@ -79,6 +83,10 @@ export class RestClient {
 
   private request<T>(path: string, init: RequestInit = {}, opts?: RequestOptions): Promise<T> {
     const timeoutMs = resolveTimeoutMs(opts);
+    return this.schedule(() => this.send<T>(path, init, timeoutMs));
+  }
+
+  private schedule<T>(send: () => Promise<T>): Promise<T> {
     // Access token fresh → the server validates it without rotating the refresh
     // token, so requests are safe to run concurrently and a hung request cannot
     // wedge the rest of the REST layer. (This relies on the gateway contract
@@ -87,9 +95,9 @@ export class RestClient {
     // back to the chain so only one request at a time can trigger (and thus
     // race) a refresh-token rotation.
     if (this.jar.accessTokenFresh(AT_FRESH_MARGIN_MS)) {
-      return this.send<T>(path, init, timeoutMs);
+      return send();
     }
-    const run = this.chain.then(() => this.send<T>(path, init, timeoutMs));
+    const run = this.chain.then(send);
     // Keep the chain alive across failures — a rejected request must not wedge
     // later ones — while still propagating the real result to the caller.
     this.chain = run.then(
@@ -97,6 +105,113 @@ export class RestClient {
       () => undefined,
     );
     return run;
+  }
+
+  /** Bytes for a message-owned preview. Local paths are gateway paths, never
+   * phone file:// URLs. No credential ever enters a media URL or a native player. */
+  mediaBytes(
+    media: MessageMedia,
+    scope: { sessionId: string; profile?: string | null },
+    signal?: AbortSignal,
+  ): Promise<MediaBytes> {
+    let url: URL;
+    let base: URL;
+    try { base = new URL(this.baseUrl); } catch { return Promise.reject(new Error('网关地址无效。')); }
+    if (!/^https?:$/.test(base.protocol) || base.username || base.password || base.search || base.hash) return Promise.reject(new Error('网关地址无效。'));
+    const prefix = base.pathname.replace(/\/+$/, '');
+    if (/^(?:\/|~\/)/.test(media.source) && !media.source.startsWith('//')) {
+      if (!scope.sessionId) return Promise.reject(new Error('会话尚未就绪，请稍后重试。'));
+      url = new URL(`${this.baseUrl.replace(/\/+$/, '')}/api/fs/download`);
+      url.searchParams.set('path', media.source);
+      url.searchParams.set('session_id', scope.sessionId);
+      if (scope.profile) url.searchParams.set('profile', scope.profile);
+    } else {
+      try { url = new URL(media.source); } catch { return Promise.reject(new Error('媒体地址无效。')); }
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password) return Promise.reject(new Error('媒体地址无效。'));
+      if ([...url.searchParams.keys()].some((key) => /^(?:token|ticket|password|authorization|access_token|refresh_token)$/i.test(key))) {
+        return Promise.reject(new Error('媒体地址包含凭据，请重新生成安全的地址。'));
+      }
+      if (url.origin === base.origin) {
+        const allowed = ['/api/media', '/api/fs/download', '/api/files/download', '/api/files/stream'].map((route) => prefix + route);
+        if (!allowed.includes(url.pathname)) return Promise.reject(new Error('此网关媒体地址不受支持。'));
+        const path = url.searchParams.get('path');
+        if (!path || !/^(?:\/|~\/)/.test(path)) return Promise.reject(new Error('媒体地址无效。'));
+        return this.mediaBytes({ ...media, source: path }, scope, signal);
+      }
+      if (url.protocol !== 'https:') return Promise.reject(new Error('外部媒体地址必须使用 HTTPS。'));
+    }
+    const authed = url.origin === base.origin;
+    const send = () => this.sendMedia(url, media, authed, signal);
+    return authed ? this.schedule(send) : send();
+  }
+
+  private async sendMedia(url: URL, media: MessageMedia, authed: boolean, signal?: AbortSignal): Promise<MediaBytes> {
+    const controller = new AbortController();
+    let timedOut = false;
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let rejectAbort: (() => void) | undefined;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      rejectAbort = () => reject(new Error(timedOut ? '媒体下载超时，请重试。' : '媒体下载已取消。'));
+      controller.signal.addEventListener('abort', rejectAbort, { once: true });
+    });
+    try {
+      if (controller.signal.aborted) throw new Error('媒体下载已取消。');
+      const cookie = authed ? this.jar.header() : null;
+      const res = await Promise.race([this.mediaFetchFn(url.toString(), {
+        method: 'GET', headers: cookie ? { Cookie: cookie } : {},
+        credentials: 'omit', redirect: 'error', signal: controller.signal,
+      }), cancelled]);
+      if (res.redirected || (res.url && new URL(res.url).origin !== url.origin) || (res.status >= 300 && res.status < 400)) {
+        throw new Error('媒体地址发生重定向，已停止下载。');
+      }
+      const setCookie = authed ? res.headers.get('set-cookie') : null;
+      if (setCookie) {
+        this.jar.ingest([setCookie]);
+        try {
+          await Promise.race([this.flushCookiePersist?.() ?? Promise.resolve(), cancelled]);
+        } catch { /* same durability policy as JSON requests */ }
+      }
+      if (controller.signal.aborted) throw new Error('媒体下载已取消。');
+      if (res.status === 401 && authed) throw new AuthError('会话已过期，请重新连接。');
+      if (!res.ok) throw new HttpError(res.status, res.status === 403 ? '无权读取此媒体。' : res.status === 404 ? '媒体文件不存在，请重新生成。' : `媒体下载失败（HTTP ${res.status}），请重试。`);
+      const mime = res.headers.get('content-type') ?? '';
+      if (!/^(?:image\/(?:png|jpe?g|gif|webp|bmp|x-ms-bmp)|audio\/(?:wav|x-wav|wave|mpeg|mp3|mp4|x-m4a))(?:;|$)/i.test(mime)) {
+        throw new Error('服务器返回的媒体类型无效，请重试。');
+      }
+      const length = Number(res.headers.get('content-length'));
+      if (length > MAX_MEDIA_BYTES) throw new Error('媒体超过 16 MB，请重新生成较小的文件。');
+      if (!res.body) throw new Error('媒体下载失败，请重试。');
+      reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      while (true) {
+        const chunk = await Promise.race([reader.read(), cancelled]);
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > MAX_MEDIA_BYTES) throw new Error('媒体超过 16 MB，请重新生成较小的文件。');
+        chunks.push(chunk.value);
+      }
+      if (controller.signal.aborted) throw new Error('媒体下载已取消。');
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      return validateMediaBytes(bytes, mime, media.kind);
+    } catch (error) {
+      if (error instanceof AuthError || error instanceof HttpError) throw error;
+      if (controller.signal.aborted) throw new Error(timedOut ? '媒体下载超时，请重试。' : '媒体下载已取消。');
+      throw new Error('媒体下载失败或内容无效，请重试。');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      if (rejectAbort) controller.signal.removeEventListener('abort', rejectAbort);
+      // Abort closes a native body even when we rejected before acquiring its reader.
+      controller.abort();
+      if (reader) void reader.cancel().catch(() => {});
+    }
   }
 
   private async send<T>(path: string, init: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<T> {

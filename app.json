@@ -2,7 +2,7 @@
   "expo": {
     "name": "Hermes 智能体",
     "slug": "hermes-mobile-app",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "hermesmobileapp",
@@ -10,10 +10,12 @@
     "ios": {
       "icon": "./assets/hermes-agent.icon",
       "bundleIdentifier": "com.dintinoconte.hermesmobile",
-      "buildNumber": "3",
+      "buildNumber": "4",
       "infoPlist": {
         "CFBundleDevelopmentRegion": "zh_CN",
-        "CFBundleLocalizations": ["zh_CN"],
+        "CFBundleLocalizations": [
+          "zh_CN"
+        ],
         "CFBundleAllowMixedLocalizations": true,
         "NSMicrophoneUsageDescription": "Hermes 仅在你主动录制音频时使用麦克风。",
         "NSPhotoLibraryAddUsageDescription": "Hermes 仅在你主动保存图片时写入照片图库。",
@@ -88,6 +90,15 @@
           "android": {
             "usesCleartextTraffic": true
           }
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Hermes 仅在你主动录制音频时使用麦克风。",
+          "recordAudioAndroid": false,
+          "enableBackgroundPlayback": false,
+          "enableBackgroundRecording": false
         }
       ]
     ],

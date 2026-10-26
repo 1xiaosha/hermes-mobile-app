@@ -3,15 +3,24 @@ import appJson from '../app.json';
 import pkg from '../package.json';
 import lock from '../package-lock.json';
 
-test('build3 declares Chinese identity, native language and matching release versions', () => {
+test('build4 declares Chinese identity, native language and matching release versions', () => {
   expect(appJson.expo.name).toBe('Hermes 智能体');
-  expect(appJson.expo.version).toBe('1.0.2');
-  expect(pkg.version).toBe('1.0.2');
-  expect(appJson.expo.ios.buildNumber).toBe('3');
+  expect(appJson.expo.version).toBe('1.0.3');
+  expect(pkg.version).toBe('1.0.3');
+  expect(appJson.expo.ios.buildNumber).toBe('4');
   expect(appJson.expo.ios.bundleIdentifier).toBe('com.dintinoconte.hermesmobile');
   expect(appJson.expo.ios.infoPlist).toMatchObject({
     CFBundleDevelopmentRegion: 'zh_CN', CFBundleLocalizations: ['zh_CN'],
   });
+});
+
+test('audio plugin uses Chinese permissions and disables background playback', () => {
+  const plugin = appJson.expo.plugins.find((p) => Array.isArray(p) && p[0] === 'expo-audio') as
+    | [string, { microphonePermission?: string; enableBackgroundPlayback?: boolean; enableBackgroundRecording?: boolean }]
+    | undefined;
+  expect(plugin?.[1].microphonePermission).toMatch(/麦克风/);
+  expect(plugin?.[1].enableBackgroundPlayback).toBe(false);
+  expect(plugin?.[1].enableBackgroundRecording).toBe(false);
 });
 
 test('release versions update only the lock roots, never the two 1.0.1 dependencies', () => {

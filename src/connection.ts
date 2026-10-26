@@ -8,6 +8,7 @@ import {
   migrateStoredConnection,
 } from './lib/stored-connection';
 import { resetConnectorState } from './connector-state';
+import { fetch as mediaFetch } from 'expo/fetch';
 
 const STORE_KEY = 'hermes-connection';
 
@@ -61,7 +62,7 @@ function activate(newJar: CookieJar, blob: StoredConnectionV2): void {
   // Connector state ("reload pending", a sign-in request) belongs to one gateway. A silent
   // re-login to the same address keeps it; a different address starts clean.
   if (rest?.baseUrl !== blob.baseUrl) resetConnectorState();
-  rest = new RestClient(blob.baseUrl, jar, undefined, flushCookiePersist);
+  rest = new RestClient(blob.baseUrl, jar, undefined, flushCookiePersist, mediaFetch as typeof fetch);
 }
 
 export function getRest(): RestClient {
@@ -166,6 +167,7 @@ export async function withAuthRetry<T>(fn: (r: RestClient) => Promise<T>): Promi
     return await fn(r);
   } catch (e) {
     if (!(e instanceof AuthError)) throw e;
+    if (r !== rest) throw e; // an abandoned owner's 401 must not re-login a new gateway
     if (!(await reloginFromStore())) {
       if (saved?.mode === 'device') throw new AuthError(REPAIR_MESSAGE);
       throw e;

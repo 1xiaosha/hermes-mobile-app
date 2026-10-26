@@ -4,6 +4,7 @@ import { requestAttach } from '../src/attach-bus';
 import ChatScreen from '../src/app/chat/[id]';
 import type { ChatItem } from '../src/components/message-row';
 import type { RpcMethods } from '../src/vendor/hermes-gateway';
+import type { SessionMessage } from '../src/api/types';
 import { createFakeGateway, HOLD, rpcErr, type FakeGateway } from '../src/api/__tests__/fixtures/fake-gateway';
 import { installFakeWebSocketGlobal, restoreWebSocketGlobal } from '../src/api/__tests__/fixtures/fake-socket';
 import { event as frame } from '../src/api/__tests__/fixtures/frames';
@@ -14,6 +15,8 @@ const mockSnapshot: Partial<RpcMethods['session.resume']['result']> = {};
 const mockPicker = jest.fn();
 const mockRead = jest.fn(async () => 'YWJj');
 const mockFiles = new Map<string, string>();
+let mockHistory: SessionMessage[] = [];
+const mockRest = { baseUrl: 'http://gateway', getMessages: async () => ({ messages: mockHistory }), claimSession: async () => {} };
 jest.mock('../src/api/gatewayClient', () => ({
   ...jest.requireActual('../src/api/gatewayClient'),
   makeNativeSocket: (url: string) => mockGateway.factory(url),
@@ -44,7 +47,8 @@ jest.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({
 jest.mock('../src/connection', () => ({
   mintGatewayUrl: async () => 'ws://gateway/api/ws?ticket=test',
   connectionInfo: async () => ({ baseUrl: 'http://gateway', deviceId: 'device', username: '' }),
-  withAuthRetry: async (fn: (rest: object) => unknown) => fn({ getMessages: async () => ({ messages: [] }), claimSession: async () => {} }),
+  getRest: () => mockRest,
+  withAuthRetry: async (fn: (rest: object) => unknown) => fn(mockRest),
 }));
 jest.mock('../src/api/models', () => ({ getModelInfo: async () => ({ model: 'test' }), modelDisplayName: (name: string) => name }));
 jest.mock('../src/profile-store', () => ({ getProfileState: () => ({ selected: null }), hydrateProfileStore: async () => {} }));
@@ -52,6 +56,10 @@ jest.mock('../src/sidebar-store', () => ({ openSidebar: () => {} }));
 jest.mock('../src/components/icon', () => ({ Icon: () => null }));
 jest.mock('../src/components/message-row', () => ({
   MessageRow: (props: { item: ChatItem }) => require('react').createElement(require('react-native').View, { testID: 'message', item: props.item }),
+}));
+// This suite owns FIFO/ACK/steer behavior. Media lifecycle has its own native doubles.
+jest.mock('../src/components/message-media', () => ({
+  MessageMediaProvider: ({ children }: { children: React.ReactNode }) => children,
 }));
 
 beforeAll(installFakeWebSocketGlobal);
@@ -76,8 +84,8 @@ async function press(label: string) {
 }
 function messages(): ChatItem[] { return screen.queryAllByTestId('message').map((row) => row.props.item); }
 function calls(method: string) { return mockGateway.sockets.flatMap((sock) => sock.sentFor(method)); }
-async function event(type: string, payload: unknown = {}) {
-  await act(async () => mockGateway.current().serverSend(frame(type, payload, { session_id: 'live' })));
+async function event(type: string, payload: unknown = {}, seq?: number) {
+  await act(async () => mockGateway.current().serverSend(frame(type, payload, { session_id: 'live', seq })));
   await settle();
 }
 const file = (name = '中文 报告.pdf') => ({ uri: `file:///phone/${name}`, name, mimeType: 'application/pdf', size: 3 });
@@ -88,6 +96,7 @@ async function pickFiles(assets = [file()]) {
 }
 beforeEach(() => {
   mockFiles.clear();
+  mockHistory = [];
   mockRouteId = 'new';
   mockRead.mockClear();
   mockPicker.mockReset();
@@ -230,6 +239,73 @@ test('interim/tool/final transcript has no duplicate assistant segment', async (
   expect(messages().map((m) => [m.role, m.text])).toEqual([
     ['assistant', 'final'], ['tool', 'terminal'], ['assistant', 'comment'], ['user', 'initial'],
   ]);
+});
+
+test('separate live interim events with identical media text retain both rows', async () => {
+  await mount(); await type('initial'); await press('发送消息');
+  const text = 'MEDIA:/Users/tong/a.wav';
+  await event('message.interim', { text, already_streamed: false });
+  await event('message.interim', { text, already_streamed: false });
+  expect(messages().filter((m) => m.role === 'assistant' && m.text === text)).toHaveLength(2);
+});
+
+test('live completion after an identical media interim retains its independent row', async () => {
+  await mount(); await type('initial'); await press('发送消息');
+  const text = 'MEDIA:/Users/tong/a.wav';
+  await event('message.interim', { text, already_streamed: false });
+  await event('message.complete', { text, status: 'complete' });
+  expect(messages().filter((m) => m.role === 'assistant' && m.text === text)).toHaveLength(2);
+});
+
+test('a live media interim identical to loaded history remains independent', async () => {
+  const text = 'MEDIA:/Users/tong/a.wav';
+  mockRouteId = 'stored';
+  mockHistory = [{ role: 'assistant', timestamp: 1, content: text }];
+  await mount();
+  await event('message.interim', { text, already_streamed: false });
+  expect(messages().filter((m) => m.role === 'assistant' && m.text === text)).toHaveLength(2);
+});
+
+test('different live event seqs preserve identical media text', async () => {
+  await mount(); await type('initial'); await press('发送消息');
+  const text = 'MEDIA:/Users/tong/a.wav';
+  await event('message.interim', { text, already_streamed: false }, 1);
+  await event('message.interim', { text, already_streamed: false }, 2);
+  expect(messages().filter((m) => m.role === 'assistant' && m.text === text)).toHaveLength(2);
+});
+
+test.each([
+  {
+    name: 'unknown history row identity',
+    events: [{ type: 'message.interim', seq: 22, payload: { text: 'MEDIA:/Users/tong/a.wav', already_streamed: false } }],
+  },
+  {
+    name: 'a new turn after a replayed completion',
+    events: [
+      { type: 'message.complete', seq: 20, payload: { text: 'MEDIA:/Users/tong/a.wav' } },
+      { type: 'message.start', seq: 21, payload: {} },
+      { type: 'message.interim', seq: 22, payload: { text: 'MEDIA:/Users/tong/a.wav', already_streamed: false } },
+    ],
+  },
+])('same-text history replay preserves both rows with $name', async ({ events }) => {
+  await mount(); await type('initial'); await press('发送消息');
+  await event('message.start', {}, 10);
+  const text = 'MEDIA:/Users/tong/a.wav';
+  mockHistory = [{ role: 'assistant', timestamp: 1, content: text }];
+  mockSnapshot.running = true;
+  mockSnapshot.status = 'working';
+  const replay = events.map((e) => ({ ...e, session_id: 'live' }));
+  mockGateway.responders['session.events.since'] = () => ({
+    events: replay, latest_seq: 30, count: replay.length, truncated: false, epoch: 'e1',
+  });
+  await act(async () => {
+    mockGateway.current().drop();
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+  });
+  await settle();
+  expect(calls('session.resume')).toHaveLength(1);
+  expect(calls('session.events.since').length).toBeGreaterThanOrEqual(2);
+  expect(messages().filter((m) => m.role === 'assistant' && m.text === text)).toHaveLength(2);
 });
 
 test('steer ACK means accepted not consumed; rejection retains text without redirect or submit', async () => {

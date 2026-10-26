@@ -2,6 +2,8 @@ import { memo } from 'react';
 import Markdown from 'react-native-markdown-display';
 import type { ThemeColors } from '@/theme';
 import { useTheme } from '@/theme';
+import { Text } from 'react-native';
+import { mediaReference } from '@/lib/message-media';
 
 function buildStyles(c: ThemeColors) {
   const code = {
@@ -45,5 +47,15 @@ function buildStyles(c: ThemeColors) {
 /** Themed markdown for completed assistant messages. Memoized — re-renders only when text changes. */
 export const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
   const { colors } = useTheme();
-  return <Markdown style={buildStyles(colors) as any}>{text}</Markdown>;
+  return <Markdown style={buildStyles(colors) as any}
+    rules={{ image: (node) => <Text key={node.key} style={{ color: colors.textDim }}>{node.attributes.alt || '图片'}</Text> }}
+    onLinkPress={(url) => {
+      if (mediaReference(url) || !/^https?:\/\//i.test(url)) return false;
+      try {
+        const link = new URL(url);
+        return !link.username && !link.password && !/\.svg$/i.test(link.pathname) &&
+          ![...link.searchParams.keys()].some((key) => /^(?:token|ticket|password|authorization|access_token|refresh_token)$/i.test(key));
+      } catch { return false; }
+    }}
+  >{text}</Markdown>;
 });

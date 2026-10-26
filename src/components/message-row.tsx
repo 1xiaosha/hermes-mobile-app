@@ -10,6 +10,8 @@ import type { ToolOutcome } from '@/lib/tool-outcome';
 import type { TodoItem } from '@/lib/todo';
 import { useTheme } from '@/theme';
 import { fileSize } from '@/lib/outgoing';
+import type { MessageMedia } from '@/lib/message-media';
+import { MessageMediaAttachments } from './message-media';
 
 export interface ToolInfo {
   id: string;
@@ -56,6 +58,7 @@ export interface ChatItem {
   imageWidth?: number;
   imageHeight?: number;
   files?: { name: string; size?: number }[];
+  media?: MessageMedia[];
   /** User message delivered via session.steer into the running turn (spec §5.3). */
   steered?: boolean;
   /** Status rows with special rendering. 'stopped' = the turn ended with status "interrupted". */
@@ -257,6 +260,7 @@ export const MessageRow = memo(function MessageRow({ item }: { item: ChatItem })
             <Text style={{ color: colors.accent }}>▍</Text>
           </Text>
         )}
+        <MessageMediaAttachments text={item.text} complete={Boolean(item.complete)} parts={item.media} messageKey={item.key} />
       </Pressable>
     );
   }

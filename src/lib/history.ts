@@ -5,6 +5,7 @@ import type { ChatItem, ToolInfo } from '@/components/message-row';
 import { messageText, reasoningText } from './message-text';
 import { toolContextFromArgs } from './tool-context';
 import { deniedSummary, toolOutcome } from './tool-outcome';
+import { historyMedia } from './message-media';
 
 /** Same cap the live tool.complete path applies to result text. */
 const MAX_TOOL_DETAIL = 4000;
@@ -48,7 +49,8 @@ export function historyToItems(messages: SessionMessage[], nextKey: () => string
     if (m.role === 'user' || m.role === 'assistant') {
       const text = messageText(m);
       const reasoning = m.role === 'assistant' ? reasoningText(m).slice(0, MAX_TOOL_DETAIL) : '';
-      if (!text.trim() && !reasoning.trim()) continue; // drop only if nothing to show
+      const media = m.role === 'assistant' ? historyMedia(m.content) : [];
+      if (!text.trim() && !reasoning.trim() && !media.length) continue; // drop only if nothing to show
       if (isInterruptClosingRow(m, text, reasoning)) {
         items.push({ key: nextKey(), role: 'status', text: '已停止', marker: 'stopped' });
         continue;
@@ -59,6 +61,7 @@ export function historyToItems(messages: SessionMessage[], nextKey: () => string
         text,
         complete: true,
         ...(reasoning.trim() ? { reasoning } : {}),
+        ...(media.length ? { media } : {}),
       });
     } else if (m.role === 'tool') {
       const name = m.tool_name?.trim();
